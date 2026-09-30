@@ -3686,6 +3686,16 @@ select_handshake_target() {
 readonly SYSCTL_CONF="${SONGBOX_TEST_SYSCTL_CONF:-/etc/sysctl.d/99-zz-vless-tuning.conf}"
 readonly SYSCTL_LEGACY="${SONGBOX_TEST_SYSCTL_LEGACY:-/etc/sysctl.d/99-bbr-proxy.conf}"
 readonly BBR_MODULE_CONF="${SONGBOX_TEST_BBR_MODULE_CONF:-/etc/modules-load.d/99-vless-bbr.conf}"
+# systemd-sysctl 与 procps 的真实加载规则：/etc、/run、/usr/local/lib、/usr/lib、/lib 下的
+# *.conf 不分目录，按文件名统一排序应用（同名文件取优先级最高的目录），/etc/sysctl.conf 最后应用。
+readonly SYSCTL_CONF_DIRS="${SONGBOX_TEST_SYSCTL_DIRS:-/etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d}"
+readonly SYSCTL_MAIN_CONF="${SONGBOX_TEST_SYSCTL_MAIN:-/etc/sysctl.conf}"
+# 启动后复核服务：在系统 sysctl 全部应用之后、网络配置之前重放本脚本的 sysctl 文件。
+# 名称刻意不带 vless- 前缀：完全卸载只清理 vless-*，网络调优仍只由第 9 项菜单移除。
+readonly BOOT_GUARD_NAME="songbox-sysctl"
+readonly BOOT_GUARD_UNIT="${SONGBOX_TEST_GUARD_UNIT:-/etc/systemd/system/${BOOT_GUARD_NAME}.service}"
+readonly BOOT_GUARD_OPENRC="${SONGBOX_TEST_GUARD_OPENRC:-/etc/init.d/${BOOT_GUARD_NAME}}"
+readonly SYSTEMD_RUNTIME_DIR="${SONGBOX_TEST_SYSTEMD_RUN:-/run/systemd/system}"
 
 # 让 Alpine/OpenRC 在重启后继续加载 /etc/sysctl.d/*.conf。
 _ensure_sysctl_boot_load() {
@@ -3723,22 +3733,90 @@ _reload_system_sysctl() {
     fi
 }
 
-# 列出所有声明过某个 key 的配置文件（不含本脚本自己的）
-_sysctl_sources() {
-    local key="$1" f esc
-    esc=$(echo "$key" | sed 's/\./\\./g')
-    for f in /etc/sysctl.conf /etc/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /run/sysctl.d/*.conf; do
-        [[ -f "$f" ]] || continue
-        [[ "$f" == "$SYSCTL_CONF" ]] && continue
-        grep -qE "^[[:space:]]*${esc}[[:space:]]*=" "$f" 2>/dev/null && echo "$f"
+# 按系统实际应用顺序列出全部 sysctl 配置文件（最后一个最终生效）
+_sysctl_config_files() {
+    local dir f base
+    local -A chosen=()
+    for dir in $SYSCTL_CONF_DIRS; do
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/*.conf; do
+            [[ -e "$f" ]] || continue
+            base=${f##*/}
+            [[ -n "${chosen[$base]+x}" ]] || chosen[$base]="$f"
+        done
     done
+    while IFS= read -r base; do
+        [[ -n "$base" ]] && printf '%s\n' "${chosen[$base]}"
+    done < <(printf '%s\n' "${!chosen[@]}" | LC_ALL=C sort)
+    [[ -f "$SYSCTL_MAIN_CONF" ]] && printf '%s\n' "$SYSCTL_MAIN_CONF"
+    return 0
 }
 
-# 判断本脚本的配置文件在加载顺序上是否处于最后
-_sysctl_loads_last() {
-    local last
-    last=$(ls /etc/sysctl.d/*.conf 2>/dev/null | sort | tail -1)
-    [[ "$last" == "$SYSCTL_CONF" ]]
+# sysctl 键可写成 net.ipv4.x 或 net/ipv4/x，行首 "-" 表示忽略该项的写入错误；统一成点号形式比较。
+_sysctl_norm_key() {
+    local k="${1#-}"
+    printf '%s' "${k//\//.}"
+}
+
+# 逐行输出 "文件<TAB>键<TAB>值"，顺序即系统应用顺序，同一键后出现者生效。
+_sysctl_scan_all() {
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        awk -v file="$f" '
+            /^[[:space:]]*$/ { next }
+            /^[[:space:]]*[#;]/ { next }
+            {
+                line = $0
+                sub(/^[[:space:]]*-?[[:space:]]*/, "", line)
+                i = index(line, "=")
+                if (i == 0) next
+                k = substr(line, 1, i - 1); v = substr(line, i + 1)
+                gsub(/^[[:space:]]+/, "", k); gsub(/[[:space:]]+$/, "", k)
+                gsub(/^[[:space:]]+/, "", v); gsub(/[[:space:]]+$/, "", v)
+                gsub(/\//, ".", k)
+                gsub(/[[:space:]]+/, " ", v)
+                printf "%s\t%s\t%s\n", file, k, v
+            }' "$f" 2>/dev/null
+    done < <(_sysctl_config_files)
+}
+
+# 状态页对几十个参数逐一查询，由调用方设置 _SYSCTL_SCAN_CACHE 可避免重复解析所有文件。
+_sysctl_scan() {
+    if [[ -n "${_SYSCTL_SCAN_CACHE+x}" ]]; then printf '%s\n' "$_SYSCTL_SCAN_CACHE"; else _sysctl_scan_all; fi
+}
+
+# 列出所有声明过某个 key 的配置文件（不含本脚本自己的），按加载顺序，最后一个是实际生效者
+_sysctl_sources() {
+    local key scan
+    key=$(_sysctl_norm_key "$1")
+    scan=$(_sysctl_scan)
+    awk -F'\t' -v k="$key" -v ours="$SYSCTL_CONF" '$2 == k && $1 != ours && !seen[$1]++ { print $1 }' <<<"$scan"
+}
+
+# 其它文件（不含本脚本）里该参数最后一次设置的值；没有则输出空
+_sysctl_others_final_value() {
+    local key scan
+    key=$(_sysctl_norm_key "$1")
+    scan=$(_sysctl_scan)
+    awk -F'\t' -v k="$key" -v ours="$SYSCTL_CONF" '$2 == k && $1 != ours { v = $3; f = 1 } END { if (f) print v }' <<<"$scan"
+}
+
+# 本脚本文件里的参数，重启时会被「排在它之后」的文件改成不同的值。
+# 输出 "键<TAB>本脚本值<TAB>覆盖值<TAB>覆盖文件"。会话内 sysctl -p 总是本脚本最后应用，
+# 看不出这类问题；重启走的是 systemd-sysctl 的全目录排序，必须按同样规则检查。
+_sysctl_boot_conflicts() {
+    local scan
+    [[ -f "$SYSCTL_CONF" ]] || return 0
+    scan=$(_sysctl_scan)
+    awk -F'\t' -v ours="$SYSCTL_CONF" '
+        $1 == ours { mine[$2] = $3; mpos[$2] = NR; next }
+        { later[$2] = $3; lfile[$2] = $1; lpos[$2] = NR }
+        END {
+            for (k in mine)
+                if ((k in later) && lpos[k] > mpos[k] && later[k] != mine[k])
+                    printf "%s\t%s\t%s\t%s\n", k, mine[k], later[k], lfile[k]
+        }' <<<"$scan" | LC_ALL=C sort
 }
 
 #── BBR 版本识别 ────────────────────────────────────────────────────────────────
@@ -3786,16 +3864,187 @@ detect_bbr_flavor() {
     return 0
 }
 
-# 只在真正应用配置时加载 BBR 模块；查看状态不会改变系统
+# 只在真正应用配置时加载 BBR 模块；查看状态不会改变系统。
+# 模块的开机持久化统一由 _finalize_tuning_persistence 在配置写入成功后处理：
+# 之前只有"这次刚好需要 modprobe"才会持久化，BBR 已被其它脚本临时加载时反而不会写入。
 _ensure_bbr_ready() {
     detect_bbr_flavor >/dev/null 2>&1 && return 0
     if command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1; then
-        mkdir -p "${BBR_MODULE_CONF%/*}"
-        printf '%s\n' tcp_bbr >"$BBR_MODULE_CONF"
         detect_bbr_flavor >/dev/null 2>&1 && return 0
     fi
     _err "当前内核没有可用的 BBR：请先安装含 BBR/BBRv3 的内核并重启"
     return 1
+}
+
+#── 重启持久化：内核模块 + 启动后复核服务 ─────────────────────────────────────────
+# 模块是否为"可加载模块"。内置(builtin)或不存在返回非 0，此时无需也无法靠 modules-load 持久化。
+_tuning_module_loadable() {
+    local mod="$1" file
+    file=$(modinfo -F filename "$mod" 2>/dev/null | head -1)
+    if [[ -n "$file" ]]; then
+        [[ "$file" != "(builtin)" ]]
+        return
+    fi
+    # 没有 modinfo 时退回已加载模块列表
+    grep -q "^${mod} " "${SONGBOX_TUNING_PROC_ROOT:-/proc}/modules" 2>/dev/null
+}
+
+# 把调优依赖的可加载模块写入 modules-load.d，保证 systemd-sysctl 运行时这些参数已经存在。
+# 例如 nf_conntrack_max 在 nf_conntrack 尚未加载的早期启动阶段会写入失败，重启后只剩内核默认值。
+# 结果数组 TUNING_MODULES 为实际可持久化的模块。
+_persist_tuning_modules() {
+    TUNING_MODULES=()
+    local mod
+    for mod in "$@"; do
+        [[ "$mod" =~ ^[a-z0-9_]+$ ]] || continue
+        _tuning_module_loadable "$mod" && TUNING_MODULES+=("$mod")
+    done
+    if (( ${#TUNING_MODULES[@]} == 0 )); then
+        rm -f "$BBR_MODULE_CONF"
+        return 0
+    fi
+    mkdir -p "${BBR_MODULE_CONF%/*}"
+    {
+        echo "# 由 ${SCRIPT_NAME} 生成：网络调优依赖的内核模块，保证 sysctl 阶段相关参数已存在"
+        printf '%s\n' "${TUNING_MODULES[@]}"
+    } >"$BBR_MODULE_CONF"
+}
+
+# 只接受绝对路径：测试或交互环境里 command -v 可能返回 shell 函数名，不能写进服务单元。
+_abs_bin() {
+    local p
+    p=$(command -v "$1" 2>/dev/null)
+    if [[ "$p" == /* ]]; then printf '%s' "$p"; else printf '%s' "$2"; fi
+}
+
+# 输出 enabled / installed / none
+_boot_guard_state() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        local boot_services
+        [[ -f "$BOOT_GUARD_OPENRC" ]] || { echo none; return 0; }
+        boot_services=$(rc-update show boot 2>/dev/null)
+        if grep -qw "$BOOT_GUARD_NAME" <<<"$boot_services"; then echo enabled; else echo installed; fi
+    else
+        [[ -f "$BOOT_GUARD_UNIT" ]] || { echo none; return 0; }
+        if systemctl is-enabled "${BOOT_GUARD_NAME}.service" >/dev/null 2>&1; then echo enabled; else echo installed; fi
+    fi
+}
+
+# 启动后复核服务：在 systemd-sysctl / 全部 sysctl.d、/etc/sysctl.conf 都应用完之后再重放本脚本文件，
+# 并排在网络配置之前（default_qdisc 只影响之后创建的队列）。这样无论哪个文件排在后面，
+# 重启后的 BBR、fq、缓冲上限与 conntrack 容量都以本脚本为准。参数为需要先 modprobe 的模块。
+_install_boot_guard() {
+    local mods="$*" sysctl_bin modprobe_bin modline=""
+    sysctl_bin=$(_abs_bin sysctl /sbin/sysctl)
+    modprobe_bin=$(_abs_bin modprobe /sbin/modprobe)
+    if [[ "$DISTRO" == "alpine" ]]; then
+        command -v rc-update >/dev/null 2>&1 || { _warn "未找到 OpenRC，无法安装启动后复核服务"; return 1; }
+        [[ -n "$mods" ]] && modline="    for m in ${mods}; do ${modprobe_bin} -q \"\$m\" >/dev/null 2>&1 || true; done"
+        cat >"$BOOT_GUARD_OPENRC" <<EOF
+#!/sbin/openrc-run
+# 由 ${SCRIPT_NAME} 生成：系统 sysctl 服务之后重放网络调优，防止被其它配置源改回
+description="songbox network tuning re-apply"
+
+depend() {
+    after sysctl modules
+    before net
+}
+
+start() {
+    ebegin "Re-applying songbox network tuning"
+${modline}
+    ${sysctl_bin} -e -p "${SYSCTL_CONF}" >/dev/null 2>&1
+    eend 0
+}
+EOF
+        chmod 755 "$BOOT_GUARD_OPENRC"
+        rc-update add "$BOOT_GUARD_NAME" boot >/dev/null 2>&1 || { _warn "无法把 ${BOOT_GUARD_NAME} 加入 OpenRC boot"; return 1; }
+        rc-service "$BOOT_GUARD_NAME" start >/dev/null 2>&1 || true
+        return 0
+    fi
+    if [[ ! -d "$SYSTEMD_RUNTIME_DIR" ]] || ! command -v systemctl >/dev/null 2>&1; then
+        _warn "未检测到 systemd，无法安装启动后复核服务"
+        return 1
+    fi
+    [[ -n "$mods" ]] && modline="ExecStartPre=-${modprobe_bin} -a -q ${mods}"
+    cat >"$BOOT_GUARD_UNIT" <<EOF
+# 由 ${SCRIPT_NAME} 生成：系统 sysctl 全部应用之后重放网络调优，防止被其它配置源改回
+[Unit]
+Description=Songbox network tuning (re-apply after all sysctl sources)
+DefaultDependencies=no
+After=systemd-modules-load.service systemd-sysctl.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+ConditionPathExists=${SYSCTL_CONF}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+${modline}
+ExecStart=-${sysctl_bin} -e -p ${SYSCTL_CONF}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$BOOT_GUARD_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # --now 让服务立即跑一次：单元文件有误会在这里暴露，而不是等到下次开机才发现
+    if ! systemctl enable --now "${BOOT_GUARD_NAME}.service" >/dev/null 2>&1; then
+        _warn "启用 ${BOOT_GUARD_NAME}.service 失败，可用 systemctl status ${BOOT_GUARD_NAME} 查看原因"
+        return 1
+    fi
+}
+
+_remove_boot_guard() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rc-update del "$BOOT_GUARD_NAME" boot >/dev/null 2>&1 || true
+        rm -f "$BOOT_GUARD_OPENRC"
+    else
+        systemctl disable --now "${BOOT_GUARD_NAME}.service" >/dev/null 2>&1 || true
+        rm -f "$BOOT_GUARD_UNIT"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+# 配置文件写入并应用成功后调用：持久化所需模块 + 安装启动后复核服务。失败只告警，不阻断调优。
+_finalize_tuning_persistence() {
+    local mods=()
+    if [[ -n "$BBR_ALGORITHM" ]] && grep -q '^net\.ipv4\.tcp_congestion_control = ' "$SYSCTL_CONF" 2>/dev/null; then
+        mods+=("tcp_${BBR_ALGORITHM}")
+    fi
+    grep -q '^net\.netfilter\.nf_conntrack_' "$SYSCTL_CONF" 2>/dev/null && mods+=(nf_conntrack)
+    _persist_tuning_modules "${mods[@]}"
+    if _install_boot_guard "${TUNING_MODULES[*]}"; then
+        _ok "已安装启动后复核服务 ${BOOT_GUARD_NAME}：每次开机在全部系统 sysctl 之后重放本脚本参数"
+    else
+        _warn "启动后复核服务未能安装：若其它配置文件排在本脚本之后，重启后 BBR 等参数可能被改回"
+    fi
+    return 0
+}
+
+# 报告"重启后会被谁改回什么"，并说明是否已有复核服务兜底
+_report_boot_conflicts() {
+    local rows key mine other file state n=0
+    state=$(_boot_guard_state)
+    rows=$(_sysctl_boot_conflicts)
+    if [[ -z "$rows" ]]; then
+        _ok "加载顺序检查：没有排在本脚本之后的配置文件改写这些参数"
+    elif [[ "$state" == enabled ]]; then
+        _info "以下参数在其它文件里被排在本脚本之后的配置改写，已由 ${BOOT_GUARD_NAME} 在开机时重放覆盖回来:"
+    else
+        _warn "以下参数重启后会被排在本脚本之后的配置改回:"
+    fi
+    while IFS=$'\t' read -r key mine other file; do
+        [[ -n "$key" ]] || continue
+        (( n++ >= 12 )) && { echo -e "    ${D}…其余项省略${NC}" >&2; break; }
+        echo -e "    ${Y}${key}${NC}: 本脚本 ${mine} → ${file} 会改为 ${other}" >&2
+    done <<<"$rows"
+    case "$state" in
+        enabled)   echo -e "  ${D}启动后复核服务 ${BOOT_GUARD_NAME}: 已启用（开机时在全部系统 sysctl 之后重放）${NC}" >&2 ;;
+        installed) _warn "启动后复核服务 ${BOOT_GUARD_NAME} 已安装但未启用，重启后可能被其它配置改回" ;;
+        *)         _warn "启动后复核服务未安装：选 3 完整套用会安装，之后重启不再被其它配置文件改回" ;;
+    esac
 }
 
 #── VPS 能力探测 ────────────────────────────────────────────────────────────────
@@ -3963,7 +4212,7 @@ detect_vps_capabilities() {
 _build_recommended_sysctl() {
     declare -gA REC_SYSCTL=()
     local mem cores rmem somax backlog filemax ctmax budget budget_usecs iface
-    local ceiling link_target pages tcp_low tcp_pressure tcp_high udp_low udp_pressure udp_high current
+    local ceiling link_target pages tcp_low tcp_pressure tcp_high udp_low udp_pressure udp_high current ra_file
     detect_vps_capabilities
     mem="$VPS_MEM_MB"; cores="$VPS_CPU_THREADS"
 
@@ -3998,6 +4247,12 @@ _build_recommended_sysctl() {
     (( backlog > somax )) && backlog="$somax"
     budget=$(( 300 + (cores - 1) * 100 )); (( budget > 1200 )) && budget=1200
     budget_usecs=$(( 2000 + (cores - 1) * 500 )); (( budget_usecs > 8000 )) && budget_usecs=8000
+    # 只上调、不下调：内核默认 netdev_budget_usecs 随 HZ 为 8000(250Hz) 或 2000(1000Hz)，
+    # 单核直接套用 2000 会把 250Hz 内核的软中断轮询时间预算缩小到 1/4，反而拖累单核代理吞吐。
+    current=$(sysctl -n net.core.netdev_budget 2>/dev/null)
+    [[ "$current" =~ ^[0-9]+$ ]] && (( current > budget )) && budget="$current"
+    current=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null)
+    [[ "$current" =~ ^[0-9]+$ ]] && (( current > budget_usecs )) && budget_usecs="$current"
     filemax=$(( mem * 1024 )); (( filemax < 65536 )) && filemax=65536
     (( filemax > 4194304 )) && filemax=4194304
     current=$(sysctl -n fs.file-max 2>/dev/null)
@@ -4072,9 +4327,13 @@ _build_recommended_sysctl() {
         REC_SYSCTL[net.ipv6.conf.default.accept_redirects]="0"
         for iface in $VPS_IPV6_IFACES $VPS_IPV6_DEFAULT_IF; do
             [[ "$iface" =~ ^[[:alnum:]_.-]+$ ]] || continue
+            ra_file="${SONGBOX_TUNING_PROC_ROOT:-/proc}/sys/net/ipv6/conf/${iface}/accept_ra"
+            [[ -f "$ra_file" ]] || continue
+            # 网卡上的 accept_ra 已被网络管理器/管理员显式设为 0（静态或 DHCPv6 地址）时不强行改回：
+            # 转发主机开启 RA 会扩大二层邻居伪造 RA 的攻击面。只对仍在使用 RA 的网卡（1/2）补成 2。
+            [[ "$(cat "$ra_file" 2>/dev/null)" == 0 ]] && continue
             # 点式 sysctl key 中，网卡名内的点必须编码成 /（例如 eth0/100）。
-            [[ -f "${SONGBOX_TUNING_PROC_ROOT:-/proc}/sys/net/ipv6/conf/${iface}/accept_ra" ]] &&
-                REC_SYSCTL["net.ipv6.conf.${iface//./\/}.accept_ra"]="2"
+            REC_SYSCTL["net.ipv6.conf.${iface//./\/}.accept_ra"]="2"
         done
     fi
 
@@ -4139,11 +4398,15 @@ show_tuning_status() {
     _line
 
     local key cur want src same=0 diff=0 miss=0
+    # 一次解析全部 sysctl 配置源供逐项查询复用；local 使其只在本次状态渲染内有效
+    local _SYSCTL_SCAN_CACHE
+    _SYSCTL_SCAN_CACHE=$(_sysctl_scan_all)
     printf "  ${W}%-42s %-22s %s${NC}\n" "参数" "当前生效值" "状态" >&2
     for key in $(printf '%s\n' "${!REC_SYSCTL[@]}" | sort); do
         want="${REC_SYSCTL[$key]}"
         cur=$(sysctl -n "$key" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ $//')
-        src=$(_sysctl_sources "$key" | head -1)
+        # 多个文件声明同一参数时，最后加载的那个才是实际设定者
+        src=$(_sysctl_sources "$key" | tail -1)
         if [[ -z "$cur" ]]; then
             printf "  %-42s %-22s ${D}%s${NC}\n" "$key" "(不可用)" "内核无此项" >&2
         elif [[ "$cur" == "$want" ]]; then
@@ -4169,9 +4432,10 @@ show_tuning_status() {
         _line
         echo -e "  ${W}其它配置文件也在设置这些参数:${NC}" >&2
         for f in "${conflicts[@]}"; do echo -e "    ${D}${f}${NC}" >&2; done
-        if [[ -f "$SYSCTL_CONF" ]] && ! _sysctl_loads_last; then
-            _warn "本脚本的 ${SYSCTL_CONF##*/} 不是最后加载，重启后可能被覆盖"
-        fi
+    fi
+    if [[ -f "$SYSCTL_CONF" ]]; then
+        _line
+        _report_boot_conflicts
     fi
     if [[ -f "$SYSCTL_LEGACY" ]]; then
         _warn "检测到旧版遗留 ${SYSCTL_LEGACY##*/}（会被 99-sysctl.conf 覆盖，建议清理）"
@@ -4183,11 +4447,20 @@ show_tuning_status() {
 apply_tuning_missing_only() {
     _ensure_bbr_ready || _warn "保留当前拥塞控制，继续应用缓冲/双栈/NAT 调优"
     _build_recommended_sysctl
-    local key want src added=0 skipped=0 lines=""
+    local key want src other added=0 skipped=0 lines="" verify_rc=0
     for key in $(_recommended_keys_apply_order); do
         want="${REC_SYSCTL[$key]}"
         [[ -z "$(sysctl -n "$key" 2>/dev/null)" ]] && continue   # 内核无此项
         src=$(_sysctl_sources "$key" | head -1)
+        # "被声明过"不等于"值正确"：其它文件把 BBR/fq 写成 cubic/fq_codel 时，跳过会让 BBR 方案失效，
+        # 这两项只有在其它文件的最终值已经等于推荐值时才允许跳过。
+        if [[ -n "$src" && ( "$key" == net.core.default_qdisc || "$key" == net.ipv4.tcp_congestion_control ) ]]; then
+            other=$(_sysctl_others_final_value "$key")
+            if [[ -n "$other" && "$other" != "$want" ]]; then
+                _warn "${key} 被 ${src##*/} 设为 ${other}，与 BBR 方案不一致，由本脚本接管该项"
+                src=""
+            fi
+        fi
         if [[ -n "$src" ]]; then
             ((skipped++))
             echo -e "  ${D}跳过 ${key}（已由 ${src##*/} 设定）${NC}" >&2
@@ -4199,6 +4472,8 @@ apply_tuning_missing_only() {
     if [[ "$added" -eq 0 ]]; then
         if [[ -f "$SYSCTL_CONF" ]]; then
             rm -f "$SYSCTL_CONF"
+            _remove_boot_guard
+            rm -f "$BBR_MODULE_CONF"
             _reload_system_sysctl || _warn "重新加载系统 sysctl 配置失败"
             _ok "其它配置已覆盖全部推荐参数，已清除本脚本的重复配置"
         else
@@ -4217,21 +4492,24 @@ apply_tuning_missing_only() {
     else
         _warn "配置文件已写入，但有参数未能立即应用"
     fi
-    _verify_tuning_applied
+    _verify_tuning_applied || verify_rc=1
+    _finalize_tuning_persistence
+    _report_boot_conflicts
+    return "$verify_rc"
 }
 
 # 完整套用推荐值（会覆盖，先备份）
 apply_tuning_full() {
     _build_recommended_sysctl
     _warn "本操作会把全部推荐值写入 ${SYSCTL_CONF}"
-    echo -e "  ${D}文件名保证最后加载，因此会覆盖其它文件里的同名项${NC}" >&2
+    echo -e "  ${D}并安装启动后复核服务，重启后其它配置文件的同名项不会再覆盖这些值${NC}" >&2
     _ask_yes "确认覆盖?" || return 0
     _ensure_bbr_ready || _warn "保留当前拥塞控制，继续应用缓冲/双栈/NAT 调优"
     _build_recommended_sysctl
-    local bk
+    local bk verify_rc=0
     bk="/root/sysctl-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
     local backup_sources=("${SYSCTL_CONF%/*}")
-    [[ -f /etc/sysctl.conf ]] && backup_sources+=(/etc/sysctl.conf)
+    [[ -f "$SYSCTL_MAIN_CONF" ]] && backup_sources+=("$SYSCTL_MAIN_CONF")
     if ! tar -czf "$bk" "${backup_sources[@]}" 2>/dev/null; then
         _err "原有 sysctl 配置备份失败，未覆盖调优文件"; return 1
     fi
@@ -4251,7 +4529,10 @@ apply_tuning_full() {
     else
         _warn "推荐配置已写入，但有参数未能立即应用（档位: ${TIER}）"
     fi
-    _verify_tuning_applied
+    _verify_tuning_applied || verify_rc=1
+    _finalize_tuning_persistence
+    _report_boot_conflicts
+    return "$verify_rc"
 }
 
 # 应用后回读实际值，逐项确认是否真的生效（防止被别的文件覆盖而不自知）
@@ -4274,6 +4555,8 @@ remove_tuning() {
     local removed=0
     [[ -f "$SYSCTL_CONF" ]] && { rm -f "$SYSCTL_CONF"; ((removed++)); }
     [[ -f "$BBR_MODULE_CONF" ]] && { rm -f "$BBR_MODULE_CONF"; ((removed++)); }
+    # 复核服务一并移除，否则它会在下次开机时重放已经删除的配置（文件不存在时单元自动跳过，但不留残件）
+    if [[ "$(_boot_guard_state)" != none ]]; then _remove_boot_guard; ((removed++)); fi
     if [[ -f "$SYSCTL_LEGACY" ]]; then
         _ask_yes "同时删除旧版遗留的 ${SYSCTL_LEGACY##*/}?" && { rm -f "$SYSCTL_LEGACY"; ((removed++)); }
     fi
@@ -4289,7 +4572,7 @@ network_tuning_menu() {
         show_tuning_status
         _item "1" "刷新状态"
         _item "2" "按 VPS 能力补齐 BBR/双栈/NAT 参数 ${D}(保留已有值，可能仍低于推荐)${NC}"
-        _item "3" "完整套用 VPS 自适应策略 ${D}(推荐；覆盖同名项，先备份)${NC}"
+        _item "3" "完整套用 VPS 自适应策略 ${D}(推荐；覆盖同名项，先备份，并安装重启后复核服务)${NC}"
         _item "4" "移除本脚本写入的配置"
         _item "5" "清理旧版遗留文件 ${D}(99-bbr-proxy.conf)${NC}"
         _item "0" "返回"
