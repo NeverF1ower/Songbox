@@ -18,7 +18,7 @@ mkdir -p "$(dirname "$SONGBOX_SYSTEM_SCRIPT")" "$SONGBOX_CFG_DIR"
 source "$ROOT_DIR/songbox.sh"
 
 [[ "$SCRIPT_NAME" == "songbox" ]] || fail "SCRIPT_NAME is not songbox"
-[[ "$VERSION" == "0.1.3" ]] || fail "unexpected release version: $VERSION"
+[[ "$VERSION" == "0.1.4" ]] || fail "unexpected release version: $VERSION"
 [[ "$SYSTEM_SCRIPT" == */songbox.sh ]] || fail "canonical path is not songbox.sh"
 [[ "$LEGACY_SYSTEM_SCRIPT" == */vless-server.sh ]] || fail "legacy path was removed"
 pass "canonical and legacy script identities are present"
