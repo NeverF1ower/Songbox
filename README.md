@@ -172,12 +172,28 @@ vless
 
 - `fq` 与可用的 BBR 拥塞控制，算法名优先级为 `bbr3`、`bbr2`、`bbr`。
 - TCP/UDP socket 缓冲区。
-- `somaxconn`、SYN backlog、netdev backlog/budget。
+- `somaxconn`、SYN backlog、netdev backlog/budget。`netdev_budget`、`netdev_budget_usecs` 只上调、不会低于当前值。
 - 本地端口范围、keepalive、MTU probing、TCP Fast Open。
 - 文件句柄上限和 conntrack 容量。
 - IPv4 转发、重定向保护与代理/NAT 所需的基础内核能力。
 
-检测到 global IPv6 地址后，还会配置 IPv6 forwarding，并设置 `accept_ra=2`，避免部分依赖 SLAAC/RA 的 VPS 在开启转发后丢失 IPv6 默认路由；支持 veth 的 `@peer` 后缀与带点号的 VLAN 网卡名。
+检测到 global IPv6 地址后，还会配置 IPv6 forwarding，并设置 `accept_ra=2`，避免部分依赖 SLAAC/RA 的 VPS 在开启转发后丢失 IPv6 默认路由；支持 veth 的 `@peer` 后缀与带点号的 VLAN 网卡名。网卡上的 `accept_ra` 已被网络管理器或管理员显式设为 0（静态或 DHCPv6 地址）时保持不变，不会强行改回接受 RA。
+
+**重启后保持不变。** systemd-sysctl 与 procps 把 `/etc/sysctl.d`、`/run/sysctl.d`、`/usr/lib/sysctl.d` 等目录里的 `*.conf` 不分目录、按文件名统一排序应用，`/etc/sysctl.conf` 最后应用。脚本的 `99-zz-` 文件只在 `/etc/sysctl.d` 内排在最后，`/run`、`/usr/lib` 下文件名更靠后的配置，或 `/etc/sysctl.conf` 里的旧 BBR 行，都会在重启后把 BBR、`fq` 改回去，而会话内 `sysctl -p` 总是脚本文件最后应用，看不出这个问题。因此第 `9` 项写入配置后会：
+
+- 按上述系统真实顺序检查，列出重启时会被谁改成什么值；支持行首带 `-` 的写法和 `net/ipv4/...` 斜杠写法。
+- 把调优依赖的可加载内核模块写入 `/etc/modules-load.d/99-vless-bbr.conf`：BBR 无论这次是否需要 `modprobe` 都会持久化；配置里有 conntrack 参数时持久化 `nf_conntrack`，否则 `nf_conntrack_max` 在 sysctl 阶段模块尚未加载时写入失败，重启后只剩内核默认值。内置进内核的模块不需要也不会写入。
+- 安装启动后复核服务 `songbox-sysctl`（systemd 单元，Alpine 为 OpenRC 服务）：在系统 sysctl 全部应用之后、网络配置之前预加载模块并重放本脚本的 sysctl 文件，重启后以本脚本为准；服务安装时会立即运行一次，单元有误当场暴露。
+- “仅补齐”模式下，`default_qdisc` 与 `tcp_congestion_control` 即使被其它文件声明过也会核对值：其它文件把它们设成 `cubic`、`fq_codel` 等与 BBR 方案不一致的值时由本脚本接管；其它参数仍保持“已有则不动”。
+
+可用以下命令确认重启后的实际结果：
+
+```
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max net.netfilter.nf_conntrack_max
+systemctl status songbox-sysctl --no-pager
+journalctl -b -u songbox-sysctl -u systemd-sysctl --no-pager
+tc qdisc show
+```
 
 需要注意：
 
@@ -249,6 +265,8 @@ SONGBOX_RESTORE_SHA256='<64位哈希>' vless --restore /root/songbox-backup.tar.
 | `/usr/local/bin/vless`、`/usr/bin/vless` | 管理脚本快捷命令 |
 | `/var/log/vless-server.log` | 脚本运行日志 |
 | `/etc/sysctl.d/99-zz-vless-tuning.conf` | 网络优化生成的 sysctl 配置 |
+| `/etc/modules-load.d/99-vless-bbr.conf` | 网络优化依赖的可加载内核模块（如 `tcp_bbr`、`nf_conntrack`） |
+| `/etc/systemd/system/songbox-sysctl.service`、`/etc/init.d/songbox-sysctl` | 启动后复核服务（systemd / Alpine OpenRC） |
 
 不要手工把 `db.json` 与生成的 `singbox.json` 分别改成不同状态。需要修改配置时优先使用菜单；如确需手工修复，完成后运行 `vless --regen-config`。
 
@@ -256,7 +274,7 @@ SONGBOX_RESTORE_SHA256='<64位哈希>' vless --restore /root/songbox-backup.tar.
 
 主菜单中的“完全卸载”会停止服务，清理脚本生成的服务单元、Nginx 配置、数据库配置和防火墙统计规则。为便于重新安装，默认会保留协议二进制和证书目录。
 
-如果曾启用第 `9` 项网络优化，并希望恢复原有 sysctl，请先进入网络优化菜单，选择“移除本脚本写入的配置”；部分内核状态需要重启后才会完全回到默认值。
+如果曾启用第 `9` 项网络优化，并希望恢复原有 sysctl，请先进入网络优化菜单，选择“移除本脚本写入的配置”，它会同时移除模块加载文件与启动后复核服务；部分内核状态需要重启后才会完全回到默认值。完全卸载只清理 `vless-*` 服务，不会移除网络优化。
 
 执行完全卸载或系统重装前，建议先运行：
 
