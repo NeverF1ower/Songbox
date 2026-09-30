@@ -176,6 +176,8 @@ assert_eq "${REC_SYSCTL[net.ipv6.conf.eth0/100.accept_ra]}" 2 "VLAN interface RA
 assert_eq "$VPS_MTU" 1500 "outlet MTU detected"
 TEST_IPV4=false
 echo -1 >"$SONGBOX_TUNING_SYS_ROOT/class/net/eth0.100/speed"
+# The sourced implementation is available here; the later definition is a test stub.
+# shellcheck disable=SC2218
 detect_vps_capabilities
 assert_eq "$VPS_HAS_IPV4" false "IPv6-only detection"
 assert_eq "$VPS_LINK_MBPS" 0 "unknown virtual speed not treated as bandwidth"
