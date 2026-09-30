@@ -21,13 +21,14 @@ jobs:
       - name: Install test dependency
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - name: Check Bash syntax
-        run: bash -n songbox.sh tests/*.sh
+        run: for file in songbox.sh tests/*.sh; do bash -n "$file" || exit; done
       - name: Run ShellCheck
         run: shellcheck --severity=warning --shell=bash songbox.sh tests/*.sh
       - name: Test backup, restore, and compatibility paths
         env:
           SONGBOX_TEST_JQ: /usr/bin/jq
         run: |
+          bash tests/test_network_tuning.sh
           bash tests/test_backup_restore.sh
           bash tests/test_name_compat.sh
           bash tests/test_decoy_templates.sh

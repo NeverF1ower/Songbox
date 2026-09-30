@@ -3682,9 +3682,10 @@ select_handshake_target() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 文件名用 99-zz- 前缀：同一 sysctl.d 目录内按字典序加载，保证晚于常见的
 # 99-kejilion-*.conf；Alpine 默认 sysctl 可能不支持 --system，必须直接 -p 应用
-readonly SYSCTL_CONF="/etc/sysctl.d/99-zz-vless-tuning.conf"
-readonly SYSCTL_LEGACY="/etc/sysctl.d/99-bbr-proxy.conf"
-readonly BBR_MODULE_CONF="/etc/modules-load.d/99-vless-bbr.conf"
+# 与 SONGBOX_CFG_DIR 一样，以下覆盖仅用于隔离回归测试。
+readonly SYSCTL_CONF="${SONGBOX_TEST_SYSCTL_CONF:-/etc/sysctl.d/99-zz-vless-tuning.conf}"
+readonly SYSCTL_LEGACY="${SONGBOX_TEST_SYSCTL_LEGACY:-/etc/sysctl.d/99-bbr-proxy.conf}"
+readonly BBR_MODULE_CONF="${SONGBOX_TEST_BBR_MODULE_CONF:-/etc/modules-load.d/99-vless-bbr.conf}"
 
 # 让 Alpine/OpenRC 在重启后继续加载 /etc/sysctl.d/*.conf。
 _ensure_sysctl_boot_load() {
@@ -3744,10 +3745,15 @@ _sysctl_loads_last() {
 # 说明：内核并未导出 BBR 的版本号，v1/v3 在 sysctl 里都叫 "bbr"。
 # 这里只能根据内核发行标识与模块信息做推断，并如实标注是推断而非确证。
 detect_bbr_flavor() {
-    BBR_AVAILABLE=false; BBR_LOADABLE=false; BBR_FLAVOR="未检测到"; BBR_EVIDENCE=""
+    BBR_AVAILABLE=false; BBR_LOADABLE=false; BBR_FLAVOR="未检测到"; BBR_EVIDENCE=""; BBR_ALGORITHM=""
     local avail kr modinfo_out
     avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
-    echo "$avail" | grep -qw bbr && BBR_AVAILABLE=true
+    local algorithm
+    for algorithm in bbr3 bbr2 bbr; do
+        if echo "$avail" | grep -qw "$algorithm"; then
+            BBR_AVAILABLE=true; BBR_ALGORITHM="$algorithm"; break
+        fi
+    done
     if [[ "$BBR_AVAILABLE" != "true" ]]; then
         if command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr >/dev/null 2>&1; then
             BBR_LOADABLE=true
@@ -3760,12 +3766,13 @@ detect_bbr_flavor() {
     kr=$(uname -r)
     modinfo_out=$(modinfo tcp_bbr 2>/dev/null)
 
-    if echo "$kr" | grep -qi 'xanmod'; then
+    if [[ "$BBR_ALGORITHM" == bbr3 ]]; then
+        BBR_FLAVOR="BBRv3 (算法名 bbr3)"; BBR_EVIDENCE="内核提供 bbr3"
+    elif [[ "$BBR_ALGORITHM" == bbr2 ]]; then
+        BBR_FLAVOR="BBRv2 (算法名 bbr2)"; BBR_EVIDENCE="内核提供 bbr2"
+    elif echo "$kr" | grep -qi 'xanmod'; then
         BBR_FLAVOR="BBRv3 (推断: XanMod 内核)"
         BBR_EVIDENCE="内核 ${kr} 为 XanMod，其 6.x 分支自带 BBRv3"
-    elif echo "$avail" | grep -qw 'bbr2'; then
-        BBR_FLAVOR="BBRv2 (内核同时提供 bbr2)"
-        BBR_EVIDENCE="tcp_available_congestion_control 含 bbr2"
     elif echo "$modinfo_out" | grep -qi 'version'; then
         BBR_FLAVOR="BBR ($(echo "$modinfo_out" | awk '/^version:/{print $2; exit}'))"
         BBR_EVIDENCE="modinfo tcp_bbr 提供了 version 字段"
@@ -3773,8 +3780,8 @@ detect_bbr_flavor() {
         BBR_FLAVOR="BBR (内核内置，无法判定版本)"
         BBR_EVIDENCE="tcp_bbr 已编入内核，非模块，无 modinfo 可读"
     else
-        BBR_FLAVOR="BBR (推断 v1，主线内核默认)"
-        BBR_EVIDENCE="内核 ${kr} 无 XanMod 等标识"
+        BBR_FLAVOR="BBR (版本无法判定)"
+        BBR_EVIDENCE="内核 ${kr} 仅导出算法名 bbr，无法仅凭版本号判定 BBR 版本"
     fi
     return 0
 }
@@ -3792,13 +3799,102 @@ _ensure_bbr_ready() {
 }
 
 #── VPS 能力探测 ────────────────────────────────────────────────────────────────
+# 找到当前进程所在 cgroup 及其可见父级；兼容 v1/v2、容器命名空间与非标准挂载点。
+_tuning_cgroup_dirs() {
+    local controller="$1" proc_root="${SONGBOX_TUNING_PROC_ROOT:-/proc}"
+    local id controllers cgpath line left right root mount fs opts dir
+    while IFS=: read -r id controllers cgpath; do
+        [[ "$id" == 0 && -z "$controllers" ]] || [[ ",$controllers," == *",${controller},"* ]] || continue
+        while IFS= read -r line; do
+            left=${line%% - *}; right=${line#* - }
+            read -r fs _ opts <<<"$right"
+            [[ "$fs" == cgroup2 && "$id" == 0 ]] ||
+                [[ "$fs" == cgroup && ",$opts," == *",${controller},"* ]] || continue
+            read -r _ _ _ root mount _ <<<"$left"
+            if [[ "$root" != / && ( "$cgpath" == "$root" || "$cgpath" == "$root/"* ) ]]; then
+                dir="${mount}${cgpath#"$root"}"
+            else
+                # cgroup namespace 中的 / 相对于 namespace 根，不一定等于 mountinfo 的宿主 root。
+                dir="${mount}${cgpath}"
+            fi
+            # 有些容器只暴露 namespace 根目录；不跟随含 .. 的宿主路径。
+            [[ "/$dir/" == *"/../"* || ! -d "$dir" ]] && dir="$mount"
+            dir=${dir%/}
+            while [[ "$dir" == "$mount" || "$dir" == "$mount/"* ]]; do
+                printf '%s\n' "$dir"
+                [[ "$dir" == "$mount" ]] && break
+                dir=${dir%/*}
+            done
+        done <"$proc_root/self/mountinfo"
+    done <"$proc_root/self/cgroup"
+}
+
+_tuning_cpuset_count() {
+    awk -F, '{for(i=1;i<=NF;i++){split($i,r,"-"); n+=(r[2]=="" ? 1 : r[2]-r[1]+1)} print n}' <<<"$1"
+}
+
+# Swap 不计入网络内存预算；以宿主 MemTotal、cgroup 硬/软上限的最小值为准。
+_detect_tuning_resources() {
+    local proc_root="${SONGBOX_TUNING_PROC_ROOT:-/proc}" dir file limit quota period cpus count
+    VPS_HOST_MEM_KB=$(awk '/^MemTotal:/{print $2}' "$proc_root/meminfo" 2>/dev/null)
+    VPS_MEM_KNOWN=true
+    if [[ ! "$VPS_HOST_MEM_KB" =~ ^[0-9]+$ || "$VPS_HOST_MEM_KB" -le 0 ]]; then
+        VPS_HOST_MEM_KB=65536; VPS_MEM_KNOWN=false
+    fi
+    VPS_MEM_KB="$VPS_HOST_MEM_KB"; VPS_RESOURCE_LIMITED=false
+    VPS_HOST_CPU_THREADS="$VPS_CPU_THREADS"
+    if [[ -r "$proc_root/self/cgroup" && -r "$proc_root/self/mountinfo" ]]; then
+        while IFS= read -r dir; do
+            for file in memory.max memory.high memory.limit_in_bytes memory.soft_limit_in_bytes; do
+                limit=$(cat "$dir/$file" 2>/dev/null)
+                # v1 的 19 位 unlimited 哨兵值忽略，不作为宿主内存参与乘法。
+                if [[ "$file" == memory.max || "$file" == memory.high ]] && [[ "$limit" == 0 ]]; then
+                    VPS_MEM_KB=1024; VPS_RESOURCE_LIMITED=true
+                fi
+                if [[ "$limit" =~ ^[0-9]+$ && ${#limit} -le 18 ]] && (( limit >= 1024 && limit / 1024 < VPS_MEM_KB )); then
+                    VPS_MEM_KB=$(( limit / 1024 )); VPS_RESOURCE_LIMITED=true
+                fi
+            done
+        done < <(_tuning_cgroup_dirs memory)
+        while IFS= read -r dir; do
+            quota=""; period=""
+            if [[ -r "$dir/cpu.max" ]]; then read -r quota period <"$dir/cpu.max"
+            else
+                quota=$(cat "$dir/cpu.cfs_quota_us" 2>/dev/null)
+                period=$(cat "$dir/cpu.cfs_period_us" 2>/dev/null)
+            fi
+            if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && (( quota > 0 && period > 0 )); then
+                count=$(( (quota + period - 1) / period ))
+                if (( count < VPS_CPU_THREADS )); then VPS_CPU_THREADS="$count"; VPS_RESOURCE_LIMITED=true; fi
+            fi
+        done < <(_tuning_cgroup_dirs cpu)
+        while IFS= read -r dir; do
+            cpus=$(cat "$dir/cpuset.cpus.effective" 2>/dev/null || cat "$dir/cpuset.cpus" 2>/dev/null)
+            [[ "$cpus" =~ ^[0-9,-]+$ ]] || continue
+            count=$(_tuning_cpuset_count "$cpus")
+            if (( count > 0 && count < VPS_CPU_THREADS )); then VPS_CPU_THREADS="$count"; VPS_RESOURCE_LIMITED=true; fi
+        done < <(_tuning_cgroup_dirs cpuset)
+    fi
+    VPS_MEM_MB=$(( VPS_MEM_KB / 1024 )); VPS_HOST_MEM_MB=$(( VPS_HOST_MEM_KB / 1024 ))
+    (( VPS_MEM_MB > 0 )) || VPS_MEM_MB=1
+    VPS_SWAP_MB=$(awk '/^SwapTotal:/{printf "%d",$2/1024}' "$proc_root/meminfo" 2>/dev/null)
+    [[ "$VPS_SWAP_MB" =~ ^[0-9]+$ ]] || VPS_SWAP_MB=0
+    VPS_PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null)
+    [[ "$VPS_PAGE_SIZE" =~ ^[0-9]+$ && "$VPS_PAGE_SIZE" -gt 0 ]] || VPS_PAGE_SIZE=4096
+}
+
+_tuning_has_key() {
+    [[ -f "${SONGBOX_TUNING_PROC_ROOT:-/proc}/sys/${1//.//}" ]]
+}
+
 # 只使用本机信息，不依赖外部 IP 查询；global IPv6 必须是网卡上真实存在的地址
 detect_vps_capabilities() {
     local cpu_flags max_khz ip4_lines ip6_lines iface speed
+    local sys_root="${SONGBOX_TUNING_SYS_ROOT:-/sys}"
 
     VPS_CPU_MODEL=""
-    VPS_CPU_THREADS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)
-    [[ "$VPS_CPU_THREADS" =~ ^[0-9]+$ ]] || VPS_CPU_THREADS=1
+    VPS_CPU_THREADS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    [[ "$VPS_CPU_THREADS" =~ ^[0-9]+$ && "$VPS_CPU_THREADS" -gt 0 ]] || VPS_CPU_THREADS=1
     VPS_CPU_CORES=""
     if command -v lscpu >/dev/null 2>&1; then
         VPS_CPU_CORES=$(LC_ALL=C lscpu -p=CORE,SOCKET 2>/dev/null | sed '/^#/d;/^$/d' | sort -u | wc -l | tr -d ' ')
@@ -3819,10 +3915,7 @@ detect_vps_capabilities() {
     VPS_CPU_CRYPTO="无 AES 指令标识"
     echo " $cpu_flags " | grep -qwE 'aes|aesni' && VPS_CPU_CRYPTO="支持 AES 指令"
 
-    VPS_MEM_MB=$(awk '/^MemTotal:/{printf "%d",($2+1023)/1024}' /proc/meminfo 2>/dev/null)
-    VPS_SWAP_MB=$(awk '/^SwapTotal:/{printf "%d",($2+1023)/1024}' /proc/meminfo 2>/dev/null)
-    [[ "$VPS_MEM_MB" =~ ^[0-9]+$ && "$VPS_MEM_MB" -gt 0 ]] || VPS_MEM_MB=1024
-    [[ "$VPS_SWAP_MB" =~ ^[0-9]+$ ]] || VPS_SWAP_MB=0
+    _detect_tuning_resources
     VPS_ARCH=$(uname -m 2>/dev/null || echo unknown)
     VPS_VIRT=$(systemd-detect-virt 2>/dev/null || true)
     [[ -n "$VPS_VIRT" && "$VPS_VIRT" != "none" ]] || VPS_VIRT=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/^Hypervisor vendor:/{sub(/^[ \t]+/,"",$2); print $2; exit}')
@@ -3832,8 +3925,8 @@ detect_vps_capabilities() {
     VPS_IPV4_DEFAULT_IF=""; VPS_IPV6_DEFAULT_IF=""; VPS_HAS_IPV4=false; VPS_HAS_IPV6=false
     VPS_IPV4_DEFAULT=false; VPS_IPV6_DEFAULT=false
     if command -v ip >/dev/null 2>&1; then
-        ip4_lines=$(ip -4 -o addr show scope global 2>/dev/null | awk '$4 !~ /^127\./ {print $2, $4}')
-        ip6_lines=$(ip -6 -o addr show scope global 2>/dev/null | awk '$4 !~ /^fe80:/ && $0 !~ / tentative| dadfailed/ {print $2, $4}')
+        ip4_lines=$(ip -4 -o addr show scope global 2>/dev/null | awk '$4 !~ /^127\./ {sub(/@.*/,"",$2); print $2, $4}')
+        ip6_lines=$(ip -6 -o addr show scope global 2>/dev/null | awk '$4 !~ /^fe80:/ && $0 !~ / tentative| dadfailed/ {sub(/@.*/,"",$2); print $2, $4}')
         VPS_IPV4_ADDRS=$(echo "$ip4_lines" | awk 'NF{print $2}' | paste -sd, -)
         VPS_IPV6_ADDRS=$(echo "$ip6_lines" | awk 'NF{print $2}' | paste -sd, -)
         VPS_IPV6_IFACES=$(echo "$ip6_lines" | awk 'NF{print $1}' | sort -u | paste -sd' ' -)
@@ -3850,23 +3943,19 @@ detect_vps_capabilities() {
 
     VPS_PRIMARY_IF="$VPS_IPV6_DEFAULT_IF"
     [[ -n "$VPS_PRIMARY_IF" ]] || VPS_PRIMARY_IF="$VPS_IPV4_DEFAULT_IF"
-    VPS_MTU="未知"; VPS_LINK_SPEED="未知"
+    VPS_MTU="未知"; VPS_LINK_SPEED="未知"; VPS_LINK_MBPS=0
     if [[ -n "$VPS_PRIMARY_IF" && "$VPS_PRIMARY_IF" =~ ^[[:alnum:]_.-]+$ ]]; then
-        [[ -r "/sys/class/net/${VPS_PRIMARY_IF}/mtu" ]] && VPS_MTU=$(cat "/sys/class/net/${VPS_PRIMARY_IF}/mtu" 2>/dev/null)
-        speed=$(cat "/sys/class/net/${VPS_PRIMARY_IF}/speed" 2>/dev/null)
-        [[ "$speed" =~ ^[0-9]+$ && "$speed" -gt 0 ]] && VPS_LINK_SPEED="${speed}Mbps"
+        [[ -r "${sys_root}/class/net/${VPS_PRIMARY_IF}/mtu" ]] && VPS_MTU=$(cat "${sys_root}/class/net/${VPS_PRIMARY_IF}/mtu" 2>/dev/null)
     fi
+    # 双栈可能使用不同出口；取可读取的最快出口速率，不把虚拟网卡速率当作套餐带宽。
+    for iface in $(printf '%s\n' "$VPS_IPV4_DEFAULT_IF" "$VPS_IPV6_DEFAULT_IF" | sort -u); do
+        [[ "$iface" =~ ^[[:alnum:]_.-]+$ ]] || continue
+        speed=$(cat "${sys_root}/class/net/${iface}/speed" 2>/dev/null)
+        [[ "$speed" =~ ^[0-9]+$ && "$speed" -gt "$VPS_LINK_MBPS" ]] && VPS_LINK_MBPS="$speed"
+    done
+    (( VPS_LINK_MBPS > 0 )) && VPS_LINK_SPEED="${VPS_LINK_MBPS}Mbps（链路标称）"
 
-    # CPU 与内存任一较弱就降低档位，防止小鸡被巨型 backlog/缓冲区反噬
-    if [[ "$VPS_MEM_MB" -le 768 || "$VPS_CPU_THREADS" -le 1 ]]; then
-        VPS_PERF_CLASS="微型"
-    elif [[ "$VPS_MEM_MB" -le 1536 || "$VPS_CPU_THREADS" -le 2 ]]; then
-        VPS_PERF_CLASS="轻量"
-    elif [[ "$VPS_MEM_MB" -le 4096 || "$VPS_CPU_THREADS" -le 4 ]]; then
-        VPS_PERF_CLASS="均衡"
-    else
-        VPS_PERF_CLASS="高性能"
-    fi
+    return 0
 }
 
 #── 推荐参数表（按 CPU + 内存 + 双栈/NAT 能力分档）──────────────────────────────
@@ -3874,26 +3963,71 @@ detect_vps_capabilities() {
 _build_recommended_sysctl() {
     declare -gA REC_SYSCTL=()
     local mem cores rmem somax backlog filemax ctmax budget budget_usecs iface
+    local ceiling link_target pages tcp_low tcp_pressure tcp_high udp_low udp_pressure udp_high current
     detect_vps_capabilities
     mem="$VPS_MEM_MB"; cores="$VPS_CPU_THREADS"
 
-    case "$VPS_PERF_CLASS" in
-        微型)   TIER="微型保护"; rmem=8388608;  somax=4096;  backlog=4096;  filemax=262144;  budget=300; budget_usecs=4000 ;;
-        轻量)   TIER="轻量代理"; rmem=16777216; somax=8192;  backlog=8192;  filemax=524288;  budget=400; budget_usecs=5000 ;;
-        均衡)   TIER="均衡代理"; rmem=33554432; somax=16384; backlog=16384; filemax=1048576; budget=500; budget_usecs=6000 ;;
-        *)      TIER="高性能代理"; rmem=67108864; somax=32768; backlog=32768; filemax=2097152; budget=600; budget_usecs=8000 ;;
-    esac
-    ctmax=$(( mem * 128 ))
-    (( cores * 32768 > ctmax )) && ctmax=$(( cores * 32768 ))
-    [[ $ctmax -lt 65536 ]] && ctmax=65536
+    # 上限不是预分配：维持较小初始值，由 TCP 按路径 BDP 自动增长。
+    if (( mem < 128 )); then
+        TIER="微型保护"; rmem=$(( mem * 1048576 / 16 ))
+        (( rmem < 262144 )) && rmem=262144
+    elif (( mem < 512 )); then TIER="轻量代理"; rmem=33554432
+    elif (( mem < 2048 )); then TIER="均衡代理"; rmem=67108864
+    elif (( mem < 8192 )); then TIER="高性能代理"; rmem=134217728
+    else TIER="大内存代理"; rmem=268435456
+    fi
+    # 给 200ms 路径、约 2 倍 BDP 留出空间（不是 RTT 实测）。高速出口可上调，
+    # 但不超过有效内存 1/4 与 512MiB；速率未知时保留内存档位。
+    if (( mem >= 128 )); then
+        ceiling=$(( mem * 1048576 / 4 ))
+        (( ceiling > 536870912 )) && ceiling=536870912
+        link_target=$(( ${VPS_LINK_MBPS:-0} * 50000 ))
+        while (( rmem < link_target && rmem < ceiling )); do rmem=$(( rmem * 2 )); done
+        (( rmem > ceiling )) && rmem="$ceiling"
+        # 保留机器已有的更高缓冲上限，前提是仍在有效内存预算内。
+        local key
+        for key in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+            current=$(sysctl -n "$key" 2>/dev/null | awk '{print $NF}')
+            [[ "$current" =~ ^[0-9]+$ ]] && (( current > rmem && current <= ceiling )) && rmem="$current"
+        done
+    fi
+    # CPU 决定单次软中断工作量，内存限制突发队列和连接元数据的容量。
+    somax=$(( mem * 16 )); backlog=$(( cores * 4096 ))
+    (( somax < 1024 )) && somax=1024
+    (( somax > 65536 )) && somax=65536
+    (( backlog > somax )) && backlog="$somax"
+    budget=$(( 300 + (cores - 1) * 100 )); (( budget > 1200 )) && budget=1200
+    budget_usecs=$(( 2000 + (cores - 1) * 500 )); (( budget_usecs > 8000 )) && budget_usecs=8000
+    filemax=$(( mem * 1024 )); (( filemax < 65536 )) && filemax=65536
+    (( filemax > 4194304 )) && filemax=4194304
+    current=$(sysctl -n fs.file-max 2>/dev/null)
+    [[ "$current" =~ ^[0-9]+$ ]] && (( current > filemax )) && filemax="$current"
+    # 按每连接约 1KiB 的预算预留 1/16 内存，CPU 不再强行抬高小内存 NAT 容量。
+    ctmax=$(( mem * 64 ))
+    [[ $ctmax -lt 1024 ]] && ctmax=1024
     [[ $ctmax -gt 1048576 ]] && ctmax=1048576
+    current=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null)
+    if [[ "$current" =~ ^[0-9]+$ ]]; then
+        current=$(( current + current / 4 + 1024 ))
+        (( current > ctmax )) && ctmax="$current"
+    fi
+    pages=$(( VPS_MEM_KB * 1024 / VPS_PAGE_SIZE ))
+    tcp_low=$(( pages / 8 )); tcp_pressure=$(( pages / 4 )); tcp_high=$(( pages / 2 ))
+    udp_low=$(( pages / 32 )); udp_pressure=$(( pages / 16 )); udp_high=$(( pages / 8 ))
 
     REC_SYSCTL[net.core.default_qdisc]="fq"
-    detect_bbr_flavor >/dev/null 2>&1 && REC_SYSCTL[net.ipv4.tcp_congestion_control]="bbr"
+    detect_bbr_flavor >/dev/null 2>&1 && REC_SYSCTL[net.ipv4.tcp_congestion_control]="$BBR_ALGORITHM"
     REC_SYSCTL[net.core.rmem_max]="$rmem"
     REC_SYSCTL[net.core.wmem_max]="$rmem"
-    REC_SYSCTL[net.ipv4.tcp_rmem]="4096 87380 $rmem"
+    REC_SYSCTL[net.core.rmem_default]="131072"
+    REC_SYSCTL[net.core.wmem_default]="65536"
+    REC_SYSCTL[net.ipv4.tcp_rmem]="4096 131072 $rmem"
     REC_SYSCTL[net.ipv4.tcp_wmem]="4096 65536 $rmem"
+    REC_SYSCTL[net.ipv4.tcp_moderate_rcvbuf]="1"
+    REC_SYSCTL[net.ipv4.tcp_window_scaling]="1"
+    REC_SYSCTL[net.ipv4.tcp_sack]="1"
+    REC_SYSCTL[net.ipv4.tcp_mem]="$tcp_low $tcp_pressure $tcp_high"
+    REC_SYSCTL[net.ipv4.udp_mem]="$udp_low $udp_pressure $udp_high"
     REC_SYSCTL[net.core.somaxconn]="$somax"
     REC_SYSCTL[net.core.netdev_max_backlog]="$backlog"
     REC_SYSCTL[net.ipv4.tcp_max_syn_backlog]="$somax"
@@ -3906,15 +4040,16 @@ _build_recommended_sysctl() {
     REC_SYSCTL[net.ipv4.tcp_keepalive_intvl]="30"
     REC_SYSCTL[net.ipv4.tcp_keepalive_probes]="3"
     REC_SYSCTL[fs.file-max]="$filemax"
-    [[ -f /proc/sys/net/core/netdev_budget ]] && REC_SYSCTL[net.core.netdev_budget]="$budget"
-    [[ -f /proc/sys/net/core/netdev_budget_usecs ]] && REC_SYSCTL[net.core.netdev_budget_usecs]="$budget_usecs"
-    [[ -f /proc/sys/net/ipv4/tcp_notsent_lowat ]] && REC_SYSCTL[net.ipv4.tcp_notsent_lowat]="131072"
-    [[ -f /proc/sys/net/ipv4/tcp_syncookies ]] && REC_SYSCTL[net.ipv4.tcp_syncookies]="1"
+    _tuning_has_key net.core.netdev_budget && REC_SYSCTL[net.core.netdev_budget]="$budget"
+    _tuning_has_key net.core.netdev_budget_usecs && REC_SYSCTL[net.core.netdev_budget_usecs]="$budget_usecs"
+    # 固定 128KiB 会限制未发送队列，增加高速代理唤醒；恢复由 socket/内核控制。
+    _tuning_has_key net.ipv4.tcp_notsent_lowat && REC_SYSCTL[net.ipv4.tcp_notsent_lowat]="4294967295"
+    _tuning_has_key net.ipv4.tcp_syncookies && REC_SYSCTL[net.ipv4.tcp_syncookies]="1"
     # QUIC(hy2/TUIC) 吞吐取决于 UDP socket 缓冲，与 BBR 无关
     REC_SYSCTL[net.ipv4.udp_rmem_min]="8192"
     REC_SYSCTL[net.ipv4.udp_wmem_min]="8192"
     REC_SYSCTL[net.core.optmem_max]="65536"
-    [[ -f /proc/sys/net/ipv4/tcp_fastopen ]] && REC_SYSCTL[net.ipv4.tcp_fastopen]="3"
+    _tuning_has_key net.ipv4.tcp_fastopen && REC_SYSCTL[net.ipv4.tcp_fastopen]="3"
 
     # IPv4 NAT/转发：不创建 MASQUERADE/DNAT 规则，只准备内核转发与安全边界
     if [[ "$VPS_HAS_IPV4" == "true" ]]; then
@@ -3936,17 +4071,19 @@ _build_recommended_sysctl() {
         REC_SYSCTL[net.ipv6.conf.all.accept_redirects]="0"
         REC_SYSCTL[net.ipv6.conf.default.accept_redirects]="0"
         for iface in $VPS_IPV6_IFACES $VPS_IPV6_DEFAULT_IF; do
-            [[ "$iface" =~ ^[[:alnum:]_-]+$ ]] || continue
-            [[ -f "/proc/sys/net/ipv6/conf/${iface}/accept_ra" ]] && REC_SYSCTL["net.ipv6.conf.${iface}.accept_ra"]="2"
+            [[ "$iface" =~ ^[[:alnum:]_.-]+$ ]] || continue
+            # 点式 sysctl key 中，网卡名内的点必须编码成 /（例如 eth0/100）。
+            [[ -f "${SONGBOX_TUNING_PROC_ROOT:-/proc}/sys/net/ipv6/conf/${iface}/accept_ra" ]] &&
+                REC_SYSCTL["net.ipv6.conf.${iface//./\/}.accept_ra"]="2"
         done
     fi
 
-    if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    if _tuning_has_key net.netfilter.nf_conntrack_max; then
         REC_SYSCTL[net.netfilter.nf_conntrack_max]="$ctmax"
-        [[ -f /proc/sys/net/netfilter/nf_conntrack_udp_timeout ]] && REC_SYSCTL[net.netfilter.nf_conntrack_udp_timeout]="30"
-        [[ -f /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream ]] && REC_SYSCTL[net.netfilter.nf_conntrack_udp_timeout_stream]="120"
+        _tuning_has_key net.netfilter.nf_conntrack_udp_timeout && REC_SYSCTL[net.netfilter.nf_conntrack_udp_timeout]="30"
+        _tuning_has_key net.netfilter.nf_conntrack_udp_timeout_stream && REC_SYSCTL[net.netfilter.nf_conntrack_udp_timeout_stream]="120"
     fi
-    RECO_MEM="$mem"; RECO_CTMAX="$ctmax"
+    RECO_MEM="$mem"; RECO_CTMAX="$ctmax"; RECO_BUFFER_MB=$(( rmem / 1048576 ))
 }
 
 # net.ipv4.ip_forward 从 0 切到 1 时内核会重置一批 IPv4 参数，必须最先应用
@@ -3963,8 +4100,12 @@ show_tuning_status() {
     echo -e "  ${W}VPS 能力与策略${NC}" >&2
     echo -e "  内核: ${C}$(uname -r)${NC}   架构/虚拟化: ${C}${VPS_ARCH} / ${VPS_VIRT}${NC}" >&2
     echo -e "  CPU : ${C}${VPS_CPU_MODEL}${NC}" >&2
-    echo -e "        ${C}${VPS_CPU_CORES} 核 / ${VPS_CPU_THREADS} 线程 / ${VPS_CPU_MHZ:-0}MHz / ${VPS_CPU_CRYPTO}${NC}" >&2
-    echo -e "  内存: ${C}${RECO_MEM}MB${NC}   Swap: ${C}${VPS_SWAP_MB}MB${NC}   策略档位: ${C}${TIER}${NC}" >&2
+    echo -e "        ${C}${VPS_CPU_CORES} 核 / ${VPS_HOST_CPU_THREADS} 检测线程 / ${VPS_CPU_THREADS} 可用线程 / ${VPS_CPU_MHZ:-0}MHz / ${VPS_CPU_CRYPTO}${NC}" >&2
+    echo -e "  内存: ${C}${RECO_MEM}MiB（有效） / ${VPS_HOST_MEM_MB}MiB（MemTotal）${NC}   Swap: ${C}${VPS_SWAP_MB}MiB${NC}   策略档位: ${C}${TIER}${NC}" >&2
+    [[ "$VPS_RESOURCE_LIMITED" == "true" ]] && echo -e "  ${D}已按 cgroup 内存/CPU 限制收缩资源预算${NC}" >&2
+    [[ "$VPS_MEM_KNOWN" == "false" ]] && _warn "无法读取 MemTotal，暂按 64MiB 保护策略处理"
+    echo -e "  缓冲: ${C}TCP/UDP 单 socket 上限 ${RECO_BUFFER_MB}MiB${NC}（按需增长，不预分配）；CPU 决定队列预算" >&2
+    echo -e "  ${D}TCP 总预算最多有效内存 1/2、UDP 1/8；tcp_mem/udp_mem 单位为 ${VPS_PAGE_SIZE} 字节的页${NC}" >&2
     echo -e "  网卡: ${C}${VPS_PRIMARY_IF:-未检测}${NC}   MTU: ${C}${VPS_MTU}${NC}   链路: ${C}${VPS_LINK_SPEED}${NC}" >&2
     if [[ "$VPS_HAS_IPV4" == "true" ]]; then
         echo -e "  IPv4: ${G}${VPS_IPV4_ADDRS}${NC}   默认路由: $([[ "$VPS_IPV4_DEFAULT" == "true" ]] && echo -e "${G}有${NC}" || echo -e "${Y}无${NC}")" >&2
@@ -3985,13 +4126,14 @@ show_tuning_status() {
     if [[ "$BBR_AVAILABLE" == "true" ]]; then
         echo -e "  BBR : ${G}${BBR_FLAVOR}${NC}" >&2
         [[ -n "$BBR_EVIDENCE" ]] && echo -e "        ${D}依据: ${BBR_EVIDENCE}${NC}" >&2
-        echo -e "        ${D}注意: 内核不导出 BBR 版本号，以上为推断${NC}" >&2
+        [[ "$BBR_ALGORITHM" == bbr ]] && echo -e "        ${D}注意: 算法名 bbr 不导出版本号，发行标识仅供推断${NC}" >&2
     elif [[ "$BBR_LOADABLE" == "true" ]]; then
         echo -e "  BBR : ${Y}${BBR_FLAVOR}${NC}（应用时自动加载并持久化）" >&2
     else
         echo -e "  BBR : ${R}内核不支持${NC}" >&2
     fi
     echo -e "  拥塞控制: ${G}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${NC}   队列: ${G}$(sysctl -n net.core.default_qdisc 2>/dev/null)${NC}" >&2
+    echo -e "  ${D}default_qdisc 影响新建队列；已有网卡队列需重启后采用新默认值${NC}" >&2
     echo -e "  ${D}BBR 只作用于 TCP：REALITY/Vision/Trojan/Snell 受益；${NC}" >&2
     echo -e "  ${D}Hysteria2/TUIC 走用户态 QUIC 拥塞控制，不经内核 BBR${NC}" >&2
     _line
@@ -4039,7 +4181,7 @@ show_tuning_status() {
 
 # 只补齐"没被任何文件显式设置"的项，不动已有配置
 apply_tuning_missing_only() {
-    _ensure_bbr_ready || return 1
+    _ensure_bbr_ready || _warn "保留当前拥塞控制，继续应用缓冲/双栈/NAT 调优"
     _build_recommended_sysctl
     local key want src added=0 skipped=0 lines=""
     for key in $(_recommended_keys_apply_order); do
@@ -4084,12 +4226,16 @@ apply_tuning_full() {
     _warn "本操作会把全部推荐值写入 ${SYSCTL_CONF}"
     echo -e "  ${D}文件名保证最后加载，因此会覆盖其它文件里的同名项${NC}" >&2
     _ask_yes "确认覆盖?" || return 0
-    _ensure_bbr_ready || return 1
+    _ensure_bbr_ready || _warn "保留当前拥塞控制，继续应用缓冲/双栈/NAT 调优"
     _build_recommended_sysctl
     local bk
     bk="/root/sysctl-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
-    tar -czf "$bk" /etc/sysctl.conf /etc/sysctl.d 2>/dev/null && \
-        _ok "原有 sysctl 配置已备份: ${bk}"
+    local backup_sources=("${SYSCTL_CONF%/*}")
+    [[ -f /etc/sysctl.conf ]] && backup_sources+=(/etc/sysctl.conf)
+    if ! tar -czf "$bk" "${backup_sources[@]}" 2>/dev/null; then
+        _err "原有 sysctl 配置备份失败，未覆盖调优文件"; return 1
+    fi
+    _ok "原有 sysctl 配置已备份: ${bk}"
     {
         echo "# 由 ${SCRIPT_NAME} 生成 - $(date '+%F %T')   档位: ${TIER}"
         local key
@@ -4120,7 +4266,7 @@ _verify_tuning_applied() {
             echo -e "    ${Y}${key}${NC}: 期望 ${want} / 实际 ${cur}" >&2
             ((bad++))
         fi
-    done < <(grep -oE '^[a-zA-Z0-9_.:-]+ = ' "$SYSCTL_CONF" 2>/dev/null | sed 's/ = //')
+    done < <(grep -oE '^[a-zA-Z0-9_./:-]+ = ' "$SYSCTL_CONF" 2>/dev/null | sed 's/ = //')
     [[ "$bad" == "0" ]] && _ok "已回读确认：写入的参数全部生效"
 }
 
@@ -4142,8 +4288,8 @@ network_tuning_menu() {
         echo -e "  ${W}网络调优${NC}" >&2
         show_tuning_status
         _item "1" "刷新状态"
-        _item "2" "按 VPS 能力补齐 BBR/双栈/NAT 参数 ${D}(保留已有配置，推荐)${NC}"
-        _item "3" "完整套用 VPS 自适应策略 ${D}(会覆盖同名项，先备份)${NC}"
+        _item "2" "按 VPS 能力补齐 BBR/双栈/NAT 参数 ${D}(保留已有值，可能仍低于推荐)${NC}"
+        _item "3" "完整套用 VPS 自适应策略 ${D}(推荐；覆盖同名项，先备份)${NC}"
         _item "4" "移除本脚本写入的配置"
         _item "5" "清理旧版遗留文件 ${D}(99-bbr-proxy.conf)${NC}"
         _item "0" "返回"
