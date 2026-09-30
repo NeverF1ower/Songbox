@@ -14,6 +14,8 @@ export SONGBOX_TEST_SYSCTL_CONF="$TEST_ROOT/sysctl.d/99-zz-vless-tuning.conf"
 export SONGBOX_TEST_SYSCTL_LEGACY="$TEST_ROOT/legacy.conf"
 export SONGBOX_TEST_BBR_MODULE_CONF="$TEST_ROOT/modules.conf"
 export SONGBOX_TUNING_PROC_ROOT="$TEST_ROOT/proc"
+export SONGBOX_TUNING_BOOT_ROOT="$TEST_ROOT/boot"
+export SONGBOX_TUNING_MODULES_ROOT="$TEST_ROOT/modules"
 mkdir -p "$TEST_ROOT/sysctl.d" "$SONGBOX_TUNING_PROC_ROOT/self"
 # shellcheck source=../songbox.sh
 source "$ROOT_DIR/songbox.sh"
@@ -73,6 +75,33 @@ for key in net/core/netdev_budget net/core/netdev_budget_usecs net/ipv4/tcp_nots
     mkdir -p "$SONGBOX_TUNING_PROC_ROOT/sys/${key%/*}"
     touch "$SONGBOX_TUNING_PROC_ROOT/sys/$key"
 done
+
+# CONFIG_HZ 下限：HZ=250 的 8000us 不应被单核策略压到非法的 2000us。
+mkdir -p "$SONGBOX_TUNING_BOOT_ROOT"
+kernel_config="$SONGBOX_TUNING_BOOT_ROOT/config-$(uname -r)"
+ACTUAL[net.core.netdev_budget_usecs]=8000
+for spec in '100 20000' '250 8000' '300 6666' '1000 2000'; do
+    read -r hz expected <<<"$spec"
+    printf 'CONFIG_HZ=%s\n' "$hz" >"$kernel_config"
+    _recommend_netdev_budget_usecs 2000
+    assert_eq "$RECO_NETDEV_USECS" "$expected" "CONFIG_HZ=$hz polling floor"
+done
+_recommend_netdev_budget_usecs 8000
+assert_eq "$RECO_NETDEV_USECS" 8000 "CPU target above HZ floor retained"
+printf 'CONFIG_HZ=250\n' | gzip >"$SONGBOX_TUNING_PROC_ROOT/config.gz"
+_recommend_netdev_budget_usecs 2000
+assert_eq "$RECO_NETDEV_USECS" 8000 "proc config.gz takes precedence"
+rm -f "$SONGBOX_TUNING_PROC_ROOT/config.gz" "$kernel_config"
+_recommend_netdev_budget_usecs 2000
+assert_eq "$RECO_NETDEV_USECS" 8000 "unknown HZ preserves valid current value"
+printf 'CONFIG_HZ=0\n' >"$kernel_config"
+_recommend_netdev_budget_usecs 2000
+assert_eq "$RECO_NETDEV_USECS" 8000 "invalid HZ uses current budget"
+rm -f "$kernel_config"
+unset 'ACTUAL[net.core.netdev_budget_usecs]'
+_recommend_netdev_budget_usecs 2000
+assert_eq "$RECO_NETDEV_USECS" 20000 "unreadable budget uses conservative fallback"
+pass "NAPI recommendations respect CONFIG_HZ and preserve valid values when HZ is unknown"
 
 # 检查实际资源探测函数，包括父级约束，而非只给参数生成器灌入内存数字。
 CG="$TEST_ROOT/cgroup2"
@@ -217,6 +246,17 @@ for TEST_MEM in 32 64 127 128 256 512 1024 2048 8192 32768; do
     done
 done
 pass "30 memory/CPU combinations honor the 128MiB boundary and 32MiB floor"
+
+TEST_MEM=955; TEST_CPU=1
+printf 'CONFIG_HZ=250\n' >"$kernel_config"
+_build_recommended_sysctl
+assert_eq "${REC_SYSCTL[net.core.netdev_budget_usecs]}" 8000 "single CPU HZ=250 generates a writable budget"
+rm -f "$kernel_config"
+ACTUAL[net.core.netdev_budget_usecs]=8000
+_build_recommended_sysctl
+assert_eq "${REC_SYSCTL[net.core.netdev_budget_usecs]}" 8000 "unknown HZ keeps live 8000us in generated table"
+unset 'ACTUAL[net.core.netdev_budget_usecs]'
+pass "955MiB single-CPU tuning table accepts live 8000us instead of recommending illegal 2000us"
 
 TEST_MEM=2048; TEST_CPU=1; TEST_LINK=10000
 _build_recommended_sysctl

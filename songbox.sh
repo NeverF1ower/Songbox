@@ -3887,6 +3887,38 @@ _tuning_has_key() {
     [[ -f "${SONGBOX_TUNING_PROC_ROOT:-/proc}/sys/${1//.//}" ]]
 }
 
+# 新内核限制 netdev_budget_usecs >= 2 * USEC_PER_SEC / CONFIG_HZ。
+# getconf CLK_TCK 是用户态 USER_HZ，不能当成内核 CONFIG_HZ。
+# 查看推荐值只读配置；配置不可读时保留当前有效值，避免建议内核拒绝的较小值。
+_recommend_netdev_budget_usecs() {
+    local wanted="$1" proc_root="${SONGBOX_TUNING_PROC_ROOT:-/proc}"
+    local boot_root="${SONGBOX_TUNING_BOOT_ROOT:-/boot}" modules_root="${SONGBOX_TUNING_MODULES_ROOT:-/lib/modules}"
+    local release config hz current floor
+    release=$(uname -r)
+    VPS_KERNEL_HZ=0
+    for config in "$proc_root/config.gz" "$boot_root/config-$release" "$modules_root/$release/build/.config"; do
+        [[ -r "$config" ]] || continue
+        if [[ "$config" == *.gz ]]; then
+            hz=$(gzip -cd "$config" 2>/dev/null | awk -F= '/^CONFIG_HZ=[0-9]+$/{print $2}')
+        else
+            hz=$(awk -F= '/^CONFIG_HZ=[0-9]+$/{print $2}' "$config" 2>/dev/null)
+        fi
+        if [[ "$hz" =~ ^[0-9]+$ ]] && (( hz > 0 && hz <= 1000000 )); then VPS_KERNEL_HZ="$hz"; break; fi
+    done
+    if (( VPS_KERNEL_HZ > 0 )); then
+        floor=$(( 2000000 / VPS_KERNEL_HZ ))
+        RECO_NETDEV_REASON="CONFIG_HZ=${VPS_KERNEL_HZ}，内核时间下限 ${floor}us"
+    else
+        current=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null)
+        floor=20000
+        [[ "$current" =~ ^[0-9]+$ && "$current" -gt 0 ]] && floor="$current"
+        RECO_NETDEV_REASON="CONFIG_HZ 未知，保留当前有效时间预算（读取失败则保守使用 20000us）"
+    fi
+    RECO_NETDEV_USECS="$wanted"
+    (( RECO_NETDEV_USECS < floor )) && RECO_NETDEV_USECS="$floor"
+    return 0
+}
+
 # 只使用本机信息，不依赖外部 IP 查询；global IPv6 必须是网卡上真实存在的地址
 detect_vps_capabilities() {
     local cpu_flags max_khz ip4_lines ip6_lines iface speed
@@ -3998,6 +4030,8 @@ _build_recommended_sysctl() {
     (( backlog > somax )) && backlog="$somax"
     budget=$(( 300 + (cores - 1) * 100 )); (( budget > 1200 )) && budget=1200
     budget_usecs=$(( 2000 + (cores - 1) * 500 )); (( budget_usecs > 8000 )) && budget_usecs=8000
+    _recommend_netdev_budget_usecs "$budget_usecs"
+    budget_usecs="$RECO_NETDEV_USECS"
     filemax=$(( mem * 1024 )); (( filemax < 65536 )) && filemax=65536
     (( filemax > 4194304 )) && filemax=4194304
     current=$(sysctl -n fs.file-max 2>/dev/null)
@@ -4106,6 +4140,7 @@ show_tuning_status() {
     [[ "$VPS_MEM_KNOWN" == "false" ]] && _warn "无法读取 MemTotal，暂按 64MiB 保护策略处理"
     echo -e "  缓冲: ${C}TCP/UDP 单 socket 上限 ${RECO_BUFFER_MB}MiB${NC}（按需增长，不预分配）；CPU 决定队列预算" >&2
     echo -e "  ${D}TCP 总预算最多有效内存 1/2、UDP 1/8；tcp_mem/udp_mem 单位为 ${VPS_PAGE_SIZE} 字节的页${NC}" >&2
+    _tuning_has_key net.core.netdev_budget_usecs && echo -e "  NAPI: ${C}${RECO_NETDEV_USECS}us${NC}（${RECO_NETDEV_REASON}）" >&2
     echo -e "  网卡: ${C}${VPS_PRIMARY_IF:-未检测}${NC}   MTU: ${C}${VPS_MTU}${NC}   链路: ${C}${VPS_LINK_SPEED}${NC}" >&2
     if [[ "$VPS_HAS_IPV4" == "true" ]]; then
         echo -e "  IPv4: ${G}${VPS_IPV4_ADDRS}${NC}   默认路由: $([[ "$VPS_IPV4_DEFAULT" == "true" ]] && echo -e "${G}有${NC}" || echo -e "${Y}无${NC}")" >&2

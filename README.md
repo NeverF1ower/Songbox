@@ -172,7 +172,7 @@ vless
 
 - `fq` 与可用的 BBR 拥塞控制，算法名优先级为 `bbr3`、`bbr2`、`bbr`。
 - TCP/UDP socket 缓冲区。
-- `somaxconn`、SYN backlog、netdev backlog/budget。
+- `somaxconn`、SYN backlog、netdev backlog/budget。`netdev_budget_usecs` 同时遵守内核 `2,000,000 / CONFIG_HZ` 下限（例如 HZ=250 时至少 8000us），读取 `/proc/config.gz`、`/boot/config-*` 或模块构建配置；读不到 HZ 时保留当前有效值，避免硬设内核拒绝的 2000us。`getconf CLK_TCK` 不用于推断内核 HZ。
 - 本地端口范围、keepalive、MTU probing、TCP Fast Open。
 - 文件句柄上限和 conntrack 容量。
 - IPv4 转发、重定向保护与代理/NAT 所需的基础内核能力。
