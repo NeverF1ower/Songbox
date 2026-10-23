@@ -633,7 +633,8 @@ _install_optional_tools() {
 #  结构:
 #  {
 #    "version": "<脚本版本>",
-#    "singbox": { "<proto>": [ {port, ..., users:[...]} , ... ] },
+#    "singbox": { "<proto>": [ {port, ..., outbound?, users:[...]} , ... ] },
+#               outbound 为可选的专用出口（见 db_port_outbounds）
 #    "snell":   { "<proto>": [ {...} ] },
 #    "chain_proxy": { "nodes": [ {...} ] },
 #    "balancer_groups": [ {name, strategy, nodes:[]} ],
@@ -973,11 +974,43 @@ db_rename_chain_node() {
         | .routing_rules = ((.routing_rules // []) | map(if .outbound == ("chain:" + $o) then .outbound = ("chain:" + $n) else . end))
         | .balancer_groups = ((.balancer_groups // []) | map(.nodes = ((.nodes // []) | map(if . == $o then $n else . end))))
         | (.singbox, .snell) |= with_entries(.value |= map(.users = ((.users // []) | map(
-              if .routing == ("chain:" + $o) then .routing = ("chain:" + $n) else . end))))'
+              if .routing == ("chain:" + $o) then .routing = ("chain:" + $n) else . end))))
+        | .singbox = ((.singbox // {}) | with_entries(.value |= map(
+              if .outbound == ("chain:" + $o) then .outbound = ("chain:" + $n) else . end)))'
 }
 db_set_chain_node_field() {
     _db_apply --arg n "$1" --arg f "$2" --arg v "$3" '
         .chain_proxy.nodes = ((.chain_proxy.nodes // []) | map(if .name == $n then .[$f] = $v else . end))'
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# 专用出口端口（Sing-box 实例字段 .outbound）
+#   绑定后该端口的全部流量固定走指定出口，优先级高于用户级路由与全局分流规则。
+#   取值与分流规则的 outbound 相同: direct / warp / chain:<节点> / balancer:<组> / bind:<IP>
+#   Snell 是独立进程，不经过 Sing-box 路由，因此只支持 singbox 核心。
+#───────────────────────────────────────────────────────────────────────────────
+db_port_outbounds() {  # 逐行 "proto|port|outbound"
+    _db_q '(.singbox // {}) | to_entries[] | .key as $p | .value[]?
+           | select((.outbound // "") != "") | "\($p)|\(.port)|\(.outbound)"'
+}
+db_port_outbound() { db_inst_field singbox "$1" "$2" outbound; }
+db_set_port_outbound() {  # proto port outbound（空字符串 = 解除绑定）
+    db_exists singbox "$1" || return 1
+    _db_apply --arg p "$1" --arg port "$2" --arg o "$3" '
+        .singbox[$p] = (.singbox[$p] | map(
+            if .port == ($port|tonumber)
+            then (if $o == "" then del(.outbound) else .outbound = $o end)
+            else . end))'
+}
+# 只给某一个端口实例添加用户（db_add_user 会写入该协议的全部端口）
+db_add_inst_user() {  # core proto port name secret
+    _db_apply --arg c "$1" --arg p "$2" --arg port "$3" --arg n "$4" --arg s "$5" \
+        --arg cr "$(date '+%Y-%m-%d')" '
+        .[$c][$p] = ((.[$c][$p] // []) | map(
+            if .port == ($port|tonumber)
+            then .users = ((.users // []) + [{name:$n,secret:$s,quota:0,used:0,enabled:true,
+                                              created:$cr,expire_date:"",routing:""}])
+            else . end))'
 }
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -5223,6 +5256,8 @@ _collect_needed_outbounds() {
     done
     # 负载均衡组成员需要链式出站
     db_balancer_groups | jq -r '.[] | .nodes[]? | "chain:" + .'
+    # 专用出口端口
+    db_port_outbounds | cut -d'|' -f3-
 }
 
 # _match_conditions <match> <ip_version> -> jq 片段(JSON对象，含 rule_set/domain_suffix/ip_cidr)
@@ -5283,9 +5318,12 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
 
     local inbounds="[]" outbounds="[]" endpoints="[]" rules="[]" rs_defs="[]"
     local public_tags=()
+    # 专用出口端口: [{tag, tags:[该端口全部入站tag], outbound}]
+    # tags 含 ShadowTLS 的后端入站（流量实际从后端进入路由）与多IP副本
+    local port_binds="[]"
 
     #── inbounds ────────────────────────────────────────────────────────────────
-    local proto cfg port tag arr
+    local proto cfg port tag arr pob
     for proto in $protos; do
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
@@ -5297,6 +5335,11 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
             fi
             inbounds=$(jq -nc --argjson a "$inbounds" --argjson b "$arr" '$a + $b')
             public_tags+=("$tag")
+            pob=$(echo "$cfg" | jq -r '.outbound // empty')
+            if [[ -n "$pob" ]]; then
+                port_binds=$(jq -nc --argjson a "$port_binds" --arg t "$tag" --arg o "$pob" \
+                    --argjson arr "$arr" '$a + [{tag:$t, tags:[$arr[].tag], outbound:$o}]')
+            fi
         done < <(db_instances singbox "$proto")
     done
     [[ "$(echo "$inbounds" | jq 'length')" == "0" ]] && { _err "没有有效的 inbound"; return 1; }
@@ -5323,6 +5366,9 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
                 dup=$(echo "$src" | jq -c --arg l "$in_ip" --arg nt "$new_tag" '.listen = $l | .tag = $nt')
                 inbounds=$(jq -nc --argjson a "$inbounds" --argjson b "$dup" '$a + [$b]')
                 dup_tags=$(echo "$dup_tags" | jq -c --arg nt "$new_tag" '. + [$nt]')
+                # 专用端口的副本同样走专用出口
+                port_binds=$(echo "$port_binds" | jq -c --arg t "$t" --arg nt "$new_tag" \
+                    'map(if .tag == $t then .tags += [$nt] else . end)')
             done
             if [[ "$(echo "$dup_tags" | jq 'length')" != "0" ]]; then
                 ipin_rules=$(jq -nc --argjson a "$ipin_rules" --argjson tags "$dup_tags" \
@@ -5366,7 +5412,12 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
         fi
         outbounds=$(jq -nc --argjson a "$outbounds" \
             --argjson o "$(_sb_bind_outbound "$bt" "$bip" "$biv")" '$a + [$o]')
-    done < <(db_routing_rules | jq -r '.[] | select(.outbound | startswith("bind:")) | "\(.outbound | ltrimstr("bind:"))|\(.ip_version // "")"' | sort -u)
+    done < <( {
+        db_routing_rules | jq -r '.[] | select(.outbound | startswith("bind:")) | "\(.outbound | ltrimstr("bind:"))|\(.ip_version // "")"'
+        # 专用端口与用户级路由引用的绑定出口（不区分 IP 版本，按严格同族生成）
+        _db_q '[(.singbox // {})[][]? | (.outbound // ""), (.users[]? | .routing // "")]
+               | .[] | select(startswith("bind:")) | "\(ltrimstr("bind:"))|"'
+    } | sort -u)
 
     # 全局直连出口 IP 版本（作用于默认 direct）
     local gdiv; gdiv=$(db_get_direct_ip_version)
@@ -5481,7 +5532,9 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
     [[ "$(echo "$user_rules" | jq 'length')" != "0" ]] && \
         rules=$(jq -nc --argjson a "$rules" --argjson b "$user_rules" '$a + $b')
 
-    # 全局分流规则
+    # 全局分流规则（先单独收集，最后再与专用端口规则一起组装）
+    # 访问限制（禁止回国 / 禁止 BT）另存一份，专用端口也要先过这些拦截
+    local global_rules="[]" restrict_rules="[]"
     local rline rtype rob rmatch riv rtag conds rule_json
     while IFS= read -r rline; do
         [[ -z "$rline" ]] && continue
@@ -5522,8 +5575,38 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
         else
             rule_json=$(echo "$rule_json" | jq -c --arg t "$rtag" '.outbound = $t')
         fi
-        rules=$(jq -nc --argjson a "$rules" --argjson r "$rule_json" '$a + [$r]')
+        global_rules=$(jq -nc --argjson a "$global_rules" --argjson r "$rule_json" '$a + [$r]')
+        [[ "$rtype" == restrict-* ]] && \
+            restrict_rules=$(jq -nc --argjson a "$restrict_rules" --argjson r "$rule_json" '$a + [$r]')
     done < <(db_routing_rules | jq -c '.[]')
+
+    # 专用出口端口：紧跟 sniff 之后，优先于多IP、用户级与全局规则。
+    # 出口不可用（节点/负载组已删除、WARP 未配置）时对该端口直接拒绝，
+    # 绝不回落到直连，避免本该走落地节点的流量从本机 IP 泄露。
+    local port_rules="[]" pb pb_tags pb_ob pb_tag pb_name
+    while IFS= read -r pb; do
+        [[ -z "$pb" ]] && continue
+        pb_tags=$(echo "$pb" | jq -c '.tags')
+        pb_ob=$(echo "$pb" | jq -r '.outbound')
+        pb_name=$(echo "$pb" | jq -r '.tag')
+        pb_tag=$(_rule_outbound_tag "$pb_ob" "as_is")
+        port_rules=$(jq -nc --argjson a "$port_rules" --argjson r "$restrict_rules" --argjson t "$pb_tags" \
+            '$a + [$r[] | .inbound = $t]')
+        if [[ "$pb_tag" == "__reject__" ]]; then
+            port_rules=$(jq -nc --argjson a "$port_rules" --argjson t "$pb_tags" '$a + [{inbound:$t, action:"reject"}]')
+        elif echo "$outbounds" | jq -e --arg t "$pb_tag" 'any(.[]; .tag == $t)' >/dev/null || \
+             echo "$endpoints" | jq -e --arg t "$pb_tag" 'any(.[]; .tag == $t)' >/dev/null; then
+            port_rules=$(jq -nc --argjson a "$port_rules" --argjson t "$pb_tags" --arg o "$pb_tag" \
+                '$a + [{inbound:$t, outbound:$o}]')
+        else
+            _warn "专用端口 ${pb_name} 的出口 $(_outbound_display "$pb_ob") 不可用，该端口将拒绝所有连接"
+            port_rules=$(jq -nc --argjson a "$port_rules" --argjson t "$pb_tags" '$a + [{inbound:$t, action:"reject"}]')
+        fi
+    done < <(echo "$port_binds" | jq -c '.[]')
+
+    # 组装顺序: sniff → 专用端口 → 多IP → 用户级 → 全局分流
+    rules=$(jq -nc --argjson a "$rules" --argjson p "$port_rules" --argjson g "$global_rules" \
+        '$a[0:1] + $p + $a[1:] + $g')
 
     # rule_set 定义
     local tags tg
@@ -6482,6 +6565,8 @@ show_single_protocol_info() {
     [[ -n "$ipv4" ]] && echo -e "  IPv4: ${G}${ipv4}${NC}" >&2
     [[ -n "$ipv6" ]] && echo -e "  IPv6: ${G}${ipv6}${NC}" >&2
     echo -e "  端口: ${G}${port}${NC}" >&2
+    local pob; pob=$(echo "$cfg" | jq -r '.outbound // empty')
+    [[ -n "$pob" ]] && echo -e "  出口: ${C}$(_outbound_display "$pob")${NC} ${D}(专用端口，全部流量固定走该出口)${NC}" >&2
 
     # 关键参数
     local k
@@ -7242,12 +7327,14 @@ chain_delete_node() {
     local ch; read -rp "  请选择: " ch
     [[ "$ch" == "0" || -z "$ch" ]] && return
     if [[ "$ch" == "all" ]]; then
+        for n in "${arr[@]}"; do _warn_port_refs "chain:$n"; done
         _ask_yes "确认删除所有节点及其相关分流规则?" || return
         for n in "${arr[@]}"; do db_del_chain_node "$n"; done
         _ok "已删除全部节点"; reload_config; return
     fi
     [[ "$ch" =~ ^[0-9]+$ ]] && (( ch >= 1 && ch <= ${#arr[@]} )) || { _err "无效选择"; return; }
     n="${arr[$((ch-1))]}"
+    _warn_port_refs "chain:$n"
     _ask_yes "确认删除节点 $n（同时删除引用它的分流规则）?" || return
     db_del_chain_node "$n" && { _ok "已删除 $n"; reload_config; } || _err "删除失败"
 }
@@ -7305,7 +7392,7 @@ manage_balancer_groups() {
             2)
                 local gn; _ask "要删除的组名（回车取消）" gn "" 0
                 [[ -z "$gn" ]] && continue
-                db_del_balancer_group "$gn" && { _ok "已删除 $gn"; reload_config; }
+                db_del_balancer_group "$gn" && { _ok "已删除 $gn"; _warn_port_refs "balancer:$gn"; reload_config; }
                 _pause ;;
             0) return ;;
             *) _err "无效选择"; sleep 1 ;;
@@ -7450,6 +7537,13 @@ show_routing_status() {
         echo -e "  多IP路由: ${G}● 已启用${NC} ${D}($(db_ip_routing_rules | jq 'length') 条映射)${NC}" >&2
     else
         echo -e "  多IP路由: ${D}○ 未启用${NC}" >&2
+    fi
+
+    if [[ -n "$(db_port_outbounds)" ]]; then
+        _line
+        echo -e "  ${C}专用出口端口${NC} ${D}(整端口固定出口，优先于下方规则)${NC}" >&2
+        _line
+        show_port_outbounds
     fi
 
     _line
@@ -8198,6 +8292,249 @@ manage_access_restrictions() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
+# 专用出口端口：新开一个协议端口，该端口的全部流量固定从指定出口发出
+#   例: TUIC 原在 10000 走正常分流；再开一个 TUIC 在 10001，全部流量走 SS 落地节点
+#═══════════════════════════════════════════════════════════════════════════════
+# 出口当前是否可用；不可用时生成配置会让该端口拒绝连接（不回落直连）
+_port_outbound_ok() {
+    local ws
+    case "$1" in
+        chain:*)    db_chain_exists "${1#chain:}" ;;
+        balancer:*) [[ -n "$(db_balancer_group "${1#balancer:}")" ]] ;;
+        warp)       ws=$(warp_status); [[ "$ws" == "configured" || "$ws" == "connected" ]] ;;
+        bind:*)     { get_all_public_ipv4; get_all_public_ipv6; } 2>/dev/null | grep -qxF "${1#bind:}" ;;
+        *)          return 0 ;;
+    esac
+}
+
+# 列出全部专用端口；无则返回 1
+show_port_outbounds() {
+    local proto port ob n=0
+    while IFS='|' read -r proto port ob; do
+        [[ -z "$proto" ]] && continue
+        if _port_outbound_ok "$ob"; then
+            echo -e "  ${G}●${NC} $(printf '%-18s' "$(get_protocol_name "$proto")") ${G}:${port}${NC} → ${C}$(_outbound_display "$ob")${NC}" >&2
+        else
+            echo -e "  ${R}●${NC} $(printf '%-18s' "$(get_protocol_name "$proto")") ${G}:${port}${NC} → ${R}$(_outbound_display "$ob") (出口已失效，端口拒绝连接)${NC}" >&2
+        fi
+        ((n++))
+    done < <(db_port_outbounds)
+    [[ "$n" -gt 0 ]]
+}
+
+# 引用了某出口的专用端口给出提示（删除节点 / 负载组时调用）
+_warn_port_refs() {  # outbound
+    local refs
+    refs=$(db_port_outbounds | awk -F'|' -v o="$1" '$3 == o {print $1 ":" $2}' | tr '\n' ' ')
+    [[ -z "$refs" ]] && return 0
+    _warn "以下专用端口绑定了 $(_outbound_display "$1")：${refs}"
+    echo -e "  ${D}删除后这些端口会拒绝连接（不会回落直连），请在「分流管理 → 专用出口端口」中改绑${NC}" >&2
+}
+
+_select_port_protocol() {
+    local opts=() i=1 p n
+    echo "" >&2
+    _line
+    echo -e "  ${W}选择入站协议${NC} ${D}(可与已有同协议端口并存)${NC}" >&2
+    _line
+    for p in $SINGBOX_PROTOCOLS; do
+        n=$(db_count_instances singbox "$p"); n="${n:-0}"
+        if [[ "$n" -gt 0 ]]; then
+            _item "$i" "$(get_protocol_name "$p") ${D}(已有端口: $(db_list_ports singbox "$p" | tr '\n' ',' | sed 's/,$//'))${NC}"
+        else
+            _item "$i" "$(get_protocol_name "$p")"
+        fi
+        opts+=("$p"); ((i++))
+    done
+    _item "0" "返回"
+    _line
+    echo -e "  ${D}Snell 由独立进程承载、不经过 Sing-box 路由，无法绑定出口${NC}" >&2
+    local ch; read -rp "  请选择: " ch
+    [[ "$ch" =~ ^[0-9]+$ ]] && (( ch >= 1 && ch <= ${#opts[@]} )) || return 1
+    echo "${opts[$((ch-1))]}"
+}
+
+# 选一个 Sing-box 端口实例，输出 "proto|port"
+# _pick_singbox_instance [only_bound]
+_pick_singbox_instance() {
+    local only_bound="${1:-false}" opts=() i=1 p port ob
+    for p in $(get_singbox_protocols); do
+        while IFS= read -r port; do
+            [[ -z "$port" ]] && continue
+            ob=$(db_port_outbound "$p" "$port")
+            [[ "$only_bound" == "true" && -z "$ob" ]] && continue
+            if [[ -n "$ob" ]]; then
+                _item "$i" "$(printf '%-18s' "$(get_protocol_name "$p")") :${port} → ${C}$(_outbound_display "$ob")${NC}"
+            else
+                _item "$i" "$(printf '%-18s' "$(get_protocol_name "$p")") :${port} ${D}(走分流规则)${NC}"
+            fi
+            opts+=("${p}|${port}"); ((i++))
+        done < <(db_list_ports singbox "$p")
+    done
+    [[ ${#opts[@]} -eq 0 ]] && { _warn "没有可选的端口"; return 1; }
+    _item "0" "返回"
+    _line
+    local ch; read -rp "  请选择: " ch
+    [[ "$ch" =~ ^[0-9]+$ ]] && (( ch >= 1 && ch <= ${#opts[@]} )) || return 1
+    echo "${opts[$((ch-1))]}"
+}
+
+# 新建专用端口时的默认备注（同时作为该端口的用户名，出现在订阅节点名里）
+_port_label_for() {  # proto outbound
+    local proto="$1" base n=2 label
+    case "$2" in
+        chain:*|balancer:*) base="${2#*:}" ;;
+        bind:*)             base="ip-${2#bind:}" ;;
+        *)                  base="$2" ;;
+    esac
+    base=$(_sanitize_node_name "$base")
+    # 纯数字会被当作"端口回落名"处理，加前缀避免
+    [[ -z "$base" || "$base" =~ ^[0-9]+$ ]] && base="via-${base:-node}"
+    label="$base"
+    while db_user_exists singbox "$proto" "$label"; do label="${base}-${n}"; ((n++)); done
+    echo "$label"
+}
+
+port_outbound_add() {
+    _header
+    echo -e "  ${W}新建专用出口端口${NC}" >&2
+    _line
+    echo -e "  ${D}新开一个协议端口（同协议已有端口不受影响），该端口收到的全部流量${NC}" >&2
+    echo -e "  ${D}固定从所选出口发出，不参与分流规则与用户级路由。${NC}" >&2
+    local proto; proto=$(_select_port_protocol) || { _info "已取消"; return 0; }
+
+    if [[ "$(db_chain_count)" == "0" && -z "$(db_balancer_groups | jq -r '.[0].name // empty')" ]]; then
+        _warn "还没有任何代理节点，可先在「配置链式代理」中添加 SS / SOCKS5 等节点"
+    fi
+    local ob; ob=$(_select_outbound "选择该端口的出口") || { _info "已取消"; return 0; }
+
+    local label=""
+    if is_multiuser_protocol "$proto" && [[ "$proto" != "socks" && "$proto" != "naive" ]]; then
+        local def_label in_label
+        def_label=$(_port_label_for "$proto" "$ob")
+        echo "" >&2
+        echo -e "  ${D}备注会出现在分享链接与订阅的节点名中，便于在客户端区分${NC}" >&2
+        read -rp "  节点备注 [回车使用 ${def_label}]: " in_label
+        if [[ -n "$in_label" ]]; then
+            label=$(_sanitize_node_name "$in_label")
+            [[ -z "$label" || "$label" =~ ^[0-9]+$ ]] && label="via-${label:-node}"
+            db_user_exists singbox "$proto" "$label" && { _warn "备注 ${label} 已被占用，改用 ${def_label}"; label="$def_label"; }
+        else
+            label="$def_label"
+        fi
+    fi
+
+    _info "检测基础依赖..."
+    check_dependencies || { _err "依赖检测失败"; return 1; }
+    ensure_dual_stack_listen
+
+    INSTALLED_PORTS=(); BATCH_CERT_DOMAIN=""
+    INSTALL_FORCE_NEW=1; INSTALL_USER_LABEL="$label"
+    local rc
+    _install_one_protocol "$proto"; rc=$?
+    INSTALL_FORCE_NEW=0; INSTALL_USER_LABEL=""
+    [[ "$rc" -ne 0 || ${#INSTALLED_PORTS[@]} -eq 0 ]] && return 0
+
+    local port="${INSTALLED_PORTS[0]##*:}"
+    db_set_port_outbound "$proto" "$port" "$ob" || { _err "写入出口绑定失败"; return 1; }
+
+    _info "重建配置并启动..."
+    if start_services; then
+        create_shortcut
+        sync_traffic_counters 2>/dev/null || true
+        _refresh_subscription_files
+        _dline
+        _ok "专用端口已就绪: $(get_protocol_name "$proto") :${port} → $(_outbound_display "$ob")"
+        _dline
+        case "$proto" in hy2|tuic) _warn "请确认云服务商安全组已放行 UDP 端口: ${port}" ;; esac
+        show_single_protocol_info "$proto" false "$port"
+    else
+        _err "服务启动失败，请查看日志排查"
+    fi
+}
+
+port_outbound_edit() {
+    _header
+    echo -e "  ${W}修改端口出口${NC}" >&2
+    _line
+    echo -e "  ${D}可修改专用端口的出口，也可把现有普通端口改为专用端口${NC}" >&2
+    _line
+    local sel; sel=$(_pick_singbox_instance false) || return 0
+    local proto="${sel%%|*}" port="${sel##*|}" cur
+    cur=$(db_port_outbound "$proto" "$port")
+    if [[ -n "$cur" ]]; then
+        echo "" >&2
+        echo -e "  $(get_protocol_name "$proto") :${port} 当前出口: ${C}$(_outbound_display "$cur")${NC}" >&2
+        _item "1" "更换出口"
+        _item "2" "解除绑定 ${D}(恢复为普通端口，按分流规则出站)${NC}"
+        _item "0" "返回"
+        local ch; read -rp "  请选择: " ch
+        case "$ch" in
+            1) ;;
+            2)
+                db_set_port_outbound "$proto" "$port" "" && {
+                    _ok "已解除 :${port} 的出口绑定"; reload_config; }
+                return 0 ;;
+            *) return 0 ;;
+        esac
+    fi
+    local ob; ob=$(_select_outbound "选择 :${port} 的出口") || { _info "已取消"; return 0; }
+    db_set_port_outbound "$proto" "$port" "$ob" || { _err "写入失败"; return 1; }
+    _ok "$(get_protocol_name "$proto") :${port} → $(_outbound_display "$ob")"
+    reload_config
+}
+
+port_outbound_delete() {
+    _header
+    echo -e "  ${W}删除专用端口${NC}" >&2
+    _line
+    local sel; sel=$(_pick_singbox_instance true) || return 0
+    local proto="${sel%%|*}" port="${sel##*|}"
+    _ask_yes "确认删除 $(get_protocol_name "$proto") 端口 ${port}（含该端口的凭证）?" || return 0
+    db_remove_port singbox "$proto" "$port" || { _err "删除失败"; return 1; }
+    if [[ -z "$(get_singbox_protocols)" ]]; then
+        svc stop "$SB_SVC" 2>/dev/null; svc disable "$SB_SVC" 2>/dev/null
+        rm -f "$SB_CONFIG"
+        _info "已无 Sing-box 协议，服务已停止"
+    else
+        reload_config
+    fi
+    sync_traffic_counters 2>/dev/null || true
+    _refresh_subscription_files
+    _ok "已删除端口 ${port}"
+}
+
+manage_port_outbounds() {
+    while true; do
+        _header
+        echo -e "  ${W}专用出口端口${NC}" >&2
+        _line
+        echo -e "  ${D}每个专用端口的全部流量固定走指定出口，优先于分流规则与用户级路由${NC}" >&2
+        _line
+        show_port_outbounds || echo -e "  ${D}暂无专用端口${NC}" >&2
+        _line
+        _item "1" "新建专用端口 ${D}(新协议端口 → 指定节点)${NC}"
+        _item "2" "修改端口出口 ${D}(改绑 / 解除 / 现有端口设为专用)${NC}"
+        _item "3" "删除专用端口"
+        _item "4" "查看专用端口分享链接"
+        _item "0" "返回"
+        _line
+        local ch; read -rp "  请选择: " ch
+        case "$ch" in
+            1) port_outbound_add; _pause ;;
+            2) port_outbound_edit; _pause ;;
+            3) port_outbound_delete; _pause ;;
+            4)
+                _header
+                local sel; sel=$(_pick_singbox_instance true) || { _pause; continue; }
+                show_single_protocol_info "${sel%%|*}" true "${sel##*|}" ;;
+            0) return ;;
+            *) _err "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
 # 分流管理主菜单
 #═══════════════════════════════════════════════════════════════════════════════
 manage_routing() {
@@ -8214,10 +8551,12 @@ manage_routing() {
         _item "6" "WARP 管理"
         _item "7" "访问限制"
         _item "8" "查看当前配置"
+        _item "9" "专用出口端口 ${D}(新建端口，全部流量走指定节点)${NC}"
         _item "0" "返回"
         _line
         local ch; read -rp "  请选择: " ch
         case "$ch" in
+            9) manage_port_outbounds ;;
             1) manage_chain_proxy ;;
             2) configure_routing_rules ;;
             3) manage_ip_routing ;;
@@ -8954,6 +9293,8 @@ _ask_hop() {  # 设置 HOP_ENABLE / HOP_START / HOP_END
 _handle_existing_protocol() {
     local proto="$1" core; core=$(proto_core "$proto")
     INSTALL_REPLACE_PORT=""
+    # 专用出口端口总是新建实例，不覆盖已有端口
+    [[ "${INSTALL_FORCE_NEW:-0}" == "1" ]] && return 0
     db_exists "$core" "$proto" || return 0
     local ports; ports=$(db_list_ports "$core" "$proto")
     echo "" >&2
@@ -9408,7 +9749,14 @@ _install_one_protocol() {
     if is_multiuser_protocol "$proto" && [[ -n "$secret" ]]; then
         local uname="default"
         [[ -n "${SOCKS_USERNAME:-}" ]] && uname="$SOCKS_USERNAME"
-        db_user_exists "$core" "$proto" "$uname" || db_add_user "$core" "$proto" "$uname" "$secret" 0 "" ""
+        if [[ "${INSTALL_FORCE_NEW:-0}" == "1" ]]; then
+            # 专用端口：凭证只写入这个新端口，不扩散到同协议的其它端口；
+            # 用户名即订阅里的节点备注（socks/naive 的用户名就是认证用户名，保持原样）
+            [[ -z "${SOCKS_USERNAME:-}" && -n "${INSTALL_USER_LABEL:-}" ]] && uname="$INSTALL_USER_LABEL"
+            db_add_inst_user "$core" "$proto" "$port" "$uname" "$secret"
+        else
+            db_user_exists "$core" "$proto" "$uname" || db_add_user "$core" "$proto" "$uname" "$secret" 0 "" ""
+        fi
     fi
     unset SOCKS_USERNAME
 
