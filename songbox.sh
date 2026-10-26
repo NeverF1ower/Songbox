@@ -91,9 +91,8 @@ _CACHED_IPV4=""; _CACHED_IPV6=""
 # 日志与 UI
 #═══════════════════════════════════════════════════════════════════════════════
 _log() {
-    "level": "debug",
-    "timestamp": true,
-    "output": "/var/log/vless-singbox.log"
+    local level="$1"; shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" >>"$LOG_FILE" 2>/dev/null
 }
 
 init_log() {
