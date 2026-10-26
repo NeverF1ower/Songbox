@@ -5630,7 +5630,7 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
     # cache_file 存不下任何有用状态，却会在每次启动时打开一个可能被异常重启截断的 bbolt 库。
     conf=$(jq -nc --argjson inb "$inbounds" --argjson oub "$outbounds" \
         --argjson route "$route_json" '
-        {log:{level:"warn", timestamp:true},
+        {log:{level:"debug", timestamp:true, output:"/var/log/vless-singbox.log"},
          inbounds:$inb,
          outbounds:$oub,
          route:$route}')
