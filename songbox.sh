@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  songbox v0.1.3 [Sing-box 统一内核]
+#  songbox v0.1.4 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -24,7 +24,7 @@ fi
 #
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #
-#  本地补丁 snell-fix1（未合并回上游，运行「检查脚本更新」会被覆盖）:
+#  Snell 兼容处理:
 #    1. Snell 版本不再硬编码，改为读官方发布说明动态解析，可用
 #       SNELL_V4/5/6_VERSION 环境变量强制指定；保底版本仅在取不到列表时使用
 #    2. Surge 客户端行补 v6 的 mode=（漏掉会导致 mode 不一致 → 静默超时）
@@ -34,10 +34,10 @@ fi
 #    6. Snell 多端口实例时明确告警（单配置文件限制，未根治）
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.1.3"
+readonly VERSION="0.1.4"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="songbox"
-readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14"
+readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14+surge-vless+snell6"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（保留 VLESS_* 环境变量，兼容已安装的旧版本）
@@ -1419,12 +1419,12 @@ install_singbox() {
 #───────────────────────────────────────────────────────────────────────────────
 # Snell 版本不做硬编码：先向官方发布说明查询当前实际提供下载的版本，
 # 取不到时才回退到下面的保底版本。也可用环境变量强制指定：
-#   SNELL_V6_VERSION=6.0.0rc2 vless
+#   SNELL_V6_VERSION=6.0.0 vless
 readonly SNELL_RELEASE_NOTES="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 # 保底版本：仅在拿不到官方列表时使用，不是版本上限
 readonly SNELL_V4_FALLBACK="4.1.1"
 readonly SNELL_V5_FALLBACK="5.0.1"
-readonly SNELL_V6_FALLBACK="6.0.0rc2"
+readonly SNELL_V6_FALLBACK="6.0.0"
 
 declare -A _SNELL_VER_CACHE=()
 _SNELL_PAGE_CACHE=""
@@ -1433,7 +1433,7 @@ _SNELL_PAGE_FETCHED=0
 # 已知版本的官方压缩包 SHA-256：命中即强校验。
 # 官方对 Snell 不公布校验和，新版本（含 beta/rc）默认走 _confirm_unverified 人工确认；
 # 自行校验过的可用环境变量补充，例如：
-#   SNELL_SHA256_6_0_0rc2_amd64=<64位哈希> vless
+#   SNELL_SHA256_6_0_0_amd64=<64位哈希> vless
 _snell_sha256() {  # version arch
     local _k="${1}:${2}" _envk
     _envk="SNELL_SHA256_${_k}"; _envk="${_envk//[.:-]/_}"
@@ -1514,8 +1514,9 @@ _snell_version() {  # major [quiet]
     done < <(_snell_remote_versions "$major" "$arch" 2>/dev/null)
 
     if [[ -z "$best" ]]; then
-        if [[ -n "$_SNELL_PAGE_CACHE" ]]; then
-            # 官方列表拿到了，但没有本机架构的构建 —— 别用保底版本去撞 404
+        if [[ "$major" == "6" && "$arch" == "armv7l" ]] ||
+           _snell_remote_versions "$major" '([0-9A-Za-z]+)' >/dev/null 2>&1; then
+            # 该大版本有下载列表但没有本机架构，或 v6 已明确不支持 ARMv7。
             [[ "$quiet" != "quiet" ]] && {
                 _err "官方发布页未提供 Snell v${major} 的 ${arch} 构建"
                 [[ "$major" == "6" ]] &&
@@ -1529,7 +1530,7 @@ _snell_version() {  # major [quiet]
             6) best="$SNELL_V6_FALLBACK" ;;
         esac
         [[ "$quiet" != "quiet" ]] &&
-            _warn "无法访问官方发布页，Snell v${major} 回退到保底版本 ${best}"
+            _warn "官方发布页未列出 Snell v${major} 下载，使用已知版本 ${best}"
     fi
     _SNELL_VER_CACHE["${major}:${arch}"]="$best"
     echo "$best"
@@ -1599,14 +1600,19 @@ _install_snell_generic() {  # version target_bin
     install -m 755 "$tmp/snell-server" "$tmp/staged" || { rm -rf "$tmp"; return 1; }
     _prepare_snell_binary "$tmp/staged" || { rm -rf "$tmp"; _err "Snell 兼容处理失败"; return 1; }
     _snell_binary_works "$tmp/staged" || { rm -rf "$tmp"; _err "Snell 二进制无法在当前系统运行"; return 1; }
-    install -m 755 "$tmp/staged" "$target" || { rm -rf "$tmp"; return 1; }
+    # 在目标目录暂存后原子替换；下载、校验或安装失败时保留现有程序。
+    local staged_target
+    staged_target=$(mktemp "${target}.new.XXXXXX") || { rm -rf "$tmp"; return 1; }
+    if ! install -m 755 "$tmp/staged" "$staged_target" || ! mv -f "$staged_target" "$target"; then
+        rm -f "$staged_target"; rm -rf "$tmp"; return 1
+    fi
     rm -rf "$tmp"
     _ok "Snell v${ver} 已安装: $target"
 }
 
-_snell_install_major() {  # major binary target
-    local major="$1" bname="$2" target="$3" ver cur
-    if check_cmd "$bname"; then
+_snell_install_major() {  # major binary target [force]
+    local major="$1" bname="$2" target="$3" force="${4:-}" ver cur
+    if [[ "$force" != "force" ]] && check_cmd "$bname"; then
         cur=$(_snell_installed_version "$bname")
         _ok "Snell v${major} 已安装 (${cur:-版本未知})"
         return 0
@@ -1615,9 +1621,9 @@ _snell_install_major() {  # major binary target
     _install_snell_generic "$ver" "$target"
 }
 
-install_snell()    { _snell_install_major 4 snell-server    /usr/local/bin/snell-server; }
-install_snell_v5() { _snell_install_major 5 snell-server-v5 /usr/local/bin/snell-server-v5; }
-install_snell_v6() { _snell_install_major 6 snell-server-v6 /usr/local/bin/snell-server-v6; }
+install_snell()    { _snell_install_major 4 snell-server    /usr/local/bin/snell-server "${1:-}"; }
+install_snell_v5() { _snell_install_major 5 snell-server-v5 /usr/local/bin/snell-server-v5 "${1:-}"; }
+install_snell_v6() { _snell_install_major 6 snell-server-v6 /usr/local/bin/snell-server-v6 "${1:-}"; }
 
 install_shadowtls() {
     check_cmd shadow-tls && { _ok "ShadowTLS 已安装"; return 0; }
@@ -6446,6 +6452,44 @@ build_share_link() {
     esac
 }
 
+# Surge iOS 6.0+ / Mac 6.12+：终端片段与订阅共用 VLESS 参数。
+_surge_vless_line() {  # proto cfg fallback_addr label secret
+    local proto="$1" cfg="$2" addr="$3" label="$4" secret="$5"
+    local port sni path scv line host pbk sid
+    addr=$(_instance_addr "$cfg" "$addr")
+    port=$(echo "$cfg" | jq -r '.port')
+    sni=$(echo "$cfg" | jq -r '.sni // empty')
+    line="${label} = vless, ${addr}, ${port}, username=${secret}"
+    case "$proto" in
+        vless-reality)
+            pbk=$(echo "$cfg" | jq -r '.public_key')
+            sid=$(echo "$cfg" | jq -r '.short_id // empty')
+            line+=", flow=xtls-rprx-vision, sni=${sni}, reality-public-key=${pbk}"
+            [[ -n "$sid" ]] && line+=", reality-short-id=${sid}" ;;
+        vless-vision|vless-ws)
+            _cert_real_for "$sni" && scv="false" || scv="true"
+            line+=", tls=true, sni=${sni}, skip-cert-verify=${scv}"
+            if [[ "$proto" == "vless-vision" ]]; then
+                line+=", flow=xtls-rprx-vision"
+            else
+                path=$(echo "$cfg" | jq -r '.path // "/"')
+                line+=", ws=true, ws-path=${path}, ws-headers=Host:${sni}"
+            fi ;;
+        vless-ws-notls)
+            path=$(echo "$cfg" | jq -r '.path // "/"')
+            host=$(echo "$cfg" | jq -r '.host // empty')
+            line+=", ws=true, ws-path=${path}"
+            [[ -n "$host" ]] && line+=", ws-headers=Host:${host}" ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$line"
+}
+
+# jq 的 // 会把 false 当缺省值；显式关闭 TFO 必须原样保留。
+_snell_client_tfo() {
+    echo "$1" | jq -r 'if .tfo == null then true else .tfo end'
+}
+
 # 打印 Surge / Clash 片段（针对无标准 URI 或需要特殊格式的协议）
 print_client_snippet() {
     local proto="$1" cfg="$2" addr="$3" label="$4" secret="${5:-}" uname="${6:-}"
@@ -6455,10 +6499,13 @@ print_client_snippet() {
     sni=$(echo "$cfg" | jq -r '.sni // empty')
     [[ -z "$uname" ]] && uname=$(echo "$cfg" | jq -r '.username // empty')
     case "$proto" in
+        vless-reality|vless-vision|vless-ws|vless-ws-notls)
+            echo -e "  ${Y}Surge (iOS 6.0+):${NC}" >&2
+            printf '  %b%s%b\n' "$C" "$(_surge_vless_line "$proto" "$cfg" "$addr" "$label" "$secret")" "$NC" >&2 ;;
         snell|snell-v5|snell-v6)
             psk=$(echo "$cfg" | jq -r '.psk')
             version=$(echo "$cfg" | jq -r '.version // "4"')
-            local tfo mode_p=""; tfo=$(echo "$cfg" | jq -r '.tfo // "true"')
+            local tfo mode_p=""; tfo=$(_snell_client_tfo "$cfg")
             # v6 的 mode 必须与服务端一致；低于 v6 传 mode 是 Surge 配置错误
             [[ "$version" == "6" ]] && mode_p=", mode=$(echo "$cfg" | jq -r '.mode // "default"')"
             echo -e "  ${Y}Surge:${NC}" >&2
@@ -6468,7 +6515,7 @@ print_client_snippet() {
             version=$(echo "$cfg" | jq -r '.version // "4"')
             stls=$(echo "$cfg" | jq -r '.stls_password')
             echo -e "  ${Y}Surge:${NC}" >&2
-            echo -e "  ${C}${label} = snell, ${addr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=true, shadow-tls-password=${stls}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}" >&2 ;;
+            echo -e "  ${C}${label} = snell, ${addr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=$(_snell_client_tfo "$cfg"), shadow-tls-password=${stls}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}" >&2 ;;
         ss2022|ss2022-shadowtls)
             method=$(echo "$cfg" | jq -r '.method')
             local pw; pw=$(_ss_client_password "$cfg" "$secret")
@@ -6496,12 +6543,12 @@ print_client_snippet() {
 
 # 取协议实例的“主凭证” + 展示名（default 用户或实例自身）
 _primary_secret() {    local proto="$1" cfg="$2" s
-    s=$(echo "$cfg" | jq -r '[(.users // [])[] | select((.enabled // true) == true)][0].secret // empty')
+    s=$(echo "$cfg" | jq -r '[(.users // [])[] | select(.enabled != false)][0].secret // empty')
     [[ -z "$s" ]] && s=$(echo "$cfg" | jq -r '.uuid // .password // .psk // empty')
     echo "$s"
 }
 _primary_user_name() {
-    local n; n=$(echo "$2" | jq -r '[(.users // [])[] | select((.enabled // true) == true)][0].name // empty')
+    local n; n=$(echo "$2" | jq -r '[(.users // [])[] | select(.enabled != false)][0].name // empty')
     echo "${n:-default}"
 }
 
@@ -6510,11 +6557,13 @@ _primary_user_name() {
 # 保证订阅/链接生成不会静默漏掉这些节点。
 _instance_user_pairs() {
     local proto="$1" cfg="$2" pairs
-    pairs=$(echo "$cfg" | jq -r '[(.users // [])[] | select((.enabled // true) == true)] | .[] | "\(.name)|\(.secret)"')
+    pairs=$(echo "$cfg" | jq -r '[(.users // [])[] | select(.enabled != false)] | .[] | "\(.name)|\(.secret)"')
     if [[ -n "$pairs" ]]; then
         echo "$pairs"
         return 0
     fi
+    # users[] 存在时，全员禁用应输出空订阅，不能回落到实例主凭据。
+    [[ "$(echo "$cfg" | jq '(.users // []) | length')" -gt 0 ]] && return 0
     local sec label
     sec=$(_primary_secret "$proto" "$cfg")
     [[ -z "$sec" ]] && return 1
@@ -10445,20 +10494,22 @@ gen_surge_sub() {
                 snell|snell-v5|snell-v6)
                     label=$(_node_label "$proto" "$cc" "")
                     local stfo smode=""
-                    stfo=$(echo "$cfg" | jq -r '.tfo // "true"')
+                    stfo=$(_snell_client_tfo "$cfg")
                     [[ "$version" == "6" ]] && smode=", mode=$(echo "$cfg" | jq -r '.mode // "default"')"
                     line="${label} = snell, ${iaddr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=${stfo}${smode}" ;;
                 snell-shadowtls|snell-v5-shadowtls)
                     label=$(_node_label "$proto" "$cc" "")
-                    local stfo2; stfo2=$(echo "$cfg" | jq -r '.tfo // "true"')
+                    local stfo2; stfo2=$(_snell_client_tfo "$cfg")
                     line="${label} = snell, ${iaddr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=${stfo2}, shadow-tls-password=${stls}, shadow-tls-sni=${sni}, shadow-tls-version=3" ;;
-                trojan|trojan-ws|hy2|anytls|ss-legacy|ss2022|tuic|ss2022-shadowtls|vmess-ws|socks|naive)
+                vless-reality|vless-vision|vless-ws|vless-ws-notls|trojan|trojan-ws|hy2|anytls|ss-legacy|ss2022|tuic|ss2022-shadowtls|vmess-ws|socks|naive)
                     local un sec path
                     path=$(echo "$cfg" | jq -r '.path // "/"')
                     while IFS='|' read -r un sec; do
                         [[ -z "$un" ]] && continue
                         label=$(_node_label "$proto" "$cc" "$un")
                         case "$proto" in
+                            vless-reality|vless-vision|vless-ws|vless-ws-notls)
+                                line=$(_surge_vless_line "$proto" "$cfg" "$iaddr" "$label" "$sec") ;;
                             trojan) line="${label} = trojan, ${iaddr}, ${port}, password=${sec}, sni=${sni}, skip-cert-verify=${scv}" ;;
                             trojan-ws) line="${label} = trojan, ${iaddr}, ${port}, password=${sec}, sni=${sni}, skip-cert-verify=${scv}, ws=true, ws-path=${path}, ws-headers=Host:${sni}" ;;
                             vmess-ws) line="${label} = vmess, ${iaddr}, ${port}, username=${sec}, tls=true, sni=${sni}, skip-cert-verify=${scv}, ws=true, ws-path=${path}, ws-headers=Host:${sni}, vmess-aead=true" ;;
@@ -10488,7 +10539,7 @@ loglevel = notify
 [Proxy]
 ${body}
 [Proxy Group]
-Proxy = select, ${names}
+Proxy = select, ${names:-DIRECT}
 
 [Rule]
 GEOIP,CN,DIRECT
@@ -10653,7 +10704,7 @@ show_sub_links() {
     echo -e "  ${W}订阅链接${NC}" >&2
     _line
     echo -e "  ${Y}Clash / Mihomo:${NC}  ${G}${base}/clash${NC}" >&2
-    echo -e "  ${Y}Surge:${NC}           ${G}${base}/surge${NC}" >&2
+    echo -e "  ${Y}Surge (含 VLESS):${NC} ${G}${base}/surge${NC}" >&2
     echo -e "  ${Y}V2Ray / 通用:${NC}    ${G}${base}/v2ray${NC}" >&2
     _line
     echo -e "  ${D}路径包含随机 UUID，请妥善保管${NC}" >&2
@@ -11086,9 +11137,9 @@ update_core_menu() {
                     _refresh_subscription_files
                 }
                 _pause ;;
-            3) rm -f /usr/local/bin/snell-server; install_snell; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
-            4) rm -f /usr/local/bin/snell-server-v5; install_snell_v5; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
-            5) rm -f /usr/local/bin/snell-server-v6; install_snell_v6; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
+            3) if install_snell force; then restart_all_services >/dev/null; _refresh_subscription_files; fi; _pause ;;
+            4) if install_snell_v5 force; then restart_all_services >/dev/null; _refresh_subscription_files; fi; _pause ;;
+            5) if install_snell_v6 force; then restart_all_services >/dev/null; _refresh_subscription_files; fi; _pause ;;
             0) return ;;
             *) _err "无效选择"; sleep 1 ;;
         esac
