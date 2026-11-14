@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  songbox v0.1.4 [Sing-box 统一内核]
+#  songbox v0.1.5 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -32,12 +32,17 @@ fi
 #    4. v6 推荐 DNS 按本机是否有 IPv6 出口自适应
 #    5. allow_port 识别 INPUT 默认策略 DROP/REJECT，并同步处理 ip6tables
 #    6. Snell 多端口实例时明确告警（单配置文件限制，未根治）
+#    7. v6 跟随官方 6.0.0：服务端显式写 ipv6 开关；已装预发布版（b/rc）提示更新
+#
+#  Surge 订阅（v0.1.5）:
+#    /surge        兼容版，不含 VLESS，适用于全部 Surge 版本
+#    /surge-vless  含 VLESS（REALITY / Vision / WS），需 Surge iOS 6.0+ / Mac 6.12+
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.1.4"
+readonly VERSION="0.1.5"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="songbox"
-readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14+surge-vless+snell6"
+readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14+surge-vless-sub+snell-6.0.0"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（保留 VLESS_* 环境变量，兼容已安装的旧版本）
@@ -75,6 +80,8 @@ readonly CURL_TIMEOUT_NORMAL=10
 readonly LATENCY_TEST_URL="https://www.gstatic.com/generate_204"
 readonly LATENCY_PARALLEL="${LATENCY_PARALLEL:-4}"
 readonly SUBSCRIPTION_MAX_BYTES=10485760
+# 本地订阅文件清单（生成、过期检测与原子替换共用）
+readonly SUB_FILES="base64 clash.yaml surge.conf surge-vless.conf"
 
 # 协议归属
 readonly SINGBOX_PROTOCOLS="vless-reality vless-vision vless-ws vless-ws-notls vmess-ws trojan trojan-ws hy2 tuic anytls ss2022 ss-legacy socks naive ss2022-shadowtls"
@@ -1543,6 +1550,27 @@ _snell_installed_version() {  # binary
     [[ -n "$out" ]] && echo "$out"
 }
 
+# 带 b/beta/rc 等后缀即为预发布构建
+_snell_is_prerelease() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z] ]]; }
+
+# 已装版本落后于官方最新时返回 0（任一版本未知返回 1）
+_snell_needs_upgrade() {  # installed latest
+    [[ "$1" =~ ^[0-9]+\. && "$2" =~ ^[0-9]+\. ]] || return 1
+    [[ "$(_snell_ver_key "$1")" < "$(_snell_ver_key "$2")" ]]
+}
+
+# v6 Beta/RC 期间官方明确会做不兼容的协议调整（beta2 已改过一次协议特征），
+# 服务端停在旧预发布版、而 Surge 已更新时，表现为 TCP 能连上但请求全部超时。
+_snell_upgrade_notice() {  # major installed latest
+    local major="$1" cur="$2" latest="$3"
+    _snell_needs_upgrade "$cur" "$latest" || return 0
+    _warn "Snell v${major} 当前 ${cur}，官方已发布 ${latest}"
+    if [[ "$major" == "6" ]] && _snell_is_prerelease "$cur"; then
+        echo -e "  ${D}v6 预发布版之间可能存在协议不兼容，Surge 更新后旧服务端会连接超时${NC}" >&2
+    fi
+    echo -e "  ${D}请到 [内核版本管理] 更新 Snell v${major}，客户端 Surge 也需同步到最新版${NC}" >&2
+}
+
 ensure_snell_alpine_runtime() {
     [[ "$DISTRO" == "alpine" ]] || return 0
     _info "准备 Alpine Snell 兼容运行环境..."
@@ -1615,6 +1643,11 @@ _snell_install_major() {  # major binary target [force]
     if [[ "$force" != "force" ]] && check_cmd "$bname"; then
         cur=$(_snell_installed_version "$bname")
         _ok "Snell v${major} 已安装 (${cur:-版本未知})"
+        if [[ "$major" == "6" ]]; then
+            # 发布页必须先在父 shell 抓取，命令替换里才能复用缓存
+            _snell_fetch_release_page
+            _snell_upgrade_notice "$major" "$cur" "$(_snell_version "$major" quiet)"
+        fi
         return 0
     fi
     ver=$(_snell_version "$major") || return 1
@@ -5909,7 +5942,15 @@ gen_snell_conf() {  # proto
             printf 'mode = %s\n' "$(echo "$cfg" | jq -r '.mode // "default"')"
             local dns; dns=$(echo "$cfg" | jq -r '.dns // empty')
             [[ -n "$dns" ]] && printf 'dns = %s\n' "$dns"
-            printf 'dns-ip-preference = %s\n' "$(echo "$cfg" | jq -r '.dns_ip_preference // "default"')"
+            local pref; pref=$(echo "$cfg" | jq -r '.dns_ip_preference // "default"')
+            printf 'dns-ip-preference = %s\n' "$pref"
+            # v6 仍保留 ipv6 开关（rc2 起 ipv6=false 时对 IPv6 目标给出明确报错），显式写出，
+            # 避免默认值随版本变化；用户显式选了 IPv6 偏好则尊重其选择。
+            if _has_ipv6_network || [[ "$pref" == "prefer-ipv6" || "$pref" == "ipv6-only" ]]; then
+                printf 'ipv6 = true\n'
+            else
+                printf 'ipv6 = false\n'
+            fi
         else
             [[ "$version" != "4" ]] && printf 'version = %s\n' "$version"
             if _has_ipv6; then printf 'ipv6 = true\n'; else printf 'ipv6 = false\n'; fi
@@ -6500,7 +6541,7 @@ print_client_snippet() {
     [[ -z "$uname" ]] && uname=$(echo "$cfg" | jq -r '.username // empty')
     case "$proto" in
         vless-reality|vless-vision|vless-ws|vless-ws-notls)
-            echo -e "  ${Y}Surge (iOS 6.0+):${NC}" >&2
+            echo -e "  ${Y}Surge (iOS 6.0+ / Mac 6.12+):${NC}" >&2
             printf '  %b%s%b\n' "$C" "$(_surge_vless_line "$proto" "$cfg" "$addr" "$label" "$secret")" "$NC" >&2 ;;
         snell|snell-v5|snell-v6)
             psk=$(echo "$cfg" | jq -r '.psk')
@@ -10268,7 +10309,8 @@ _subscription_files_current() {
     uuid=$(head -1 "$CFG/sub_uuid" 2>/dev/null | tr -d '\r\n')
     [[ "$uuid" =~ ^[0-9a-fA-F-]{16,64}$ ]] || return 1
     dir="$CFG/subscription/$uuid"
-    for f in base64 clash.yaml surge.conf; do
+    # 旧版本没有 surge-vless.conf，缺文件即视为过期，升级后自动补齐
+    for f in $SUB_FILES; do
         [[ -f "$dir/$f" ]] || return 1
         [[ -f "$DB_FILE" && "$DB_FILE" -nt "$dir/$f" ]] && return 1
         [[ -f "$NODE_NAME_FILE" && "$NODE_NAME_FILE" -nt "$dir/$f" ]] && return 1
@@ -10475,11 +10517,20 @@ _clash_proxy_block() {
     printf '%s' "$o"
 }
 
-gen_surge_sub() {
+# Surge 订阅分两份：
+#   surge.conf        兼容版，不含 VLESS。Surge 解析配置时遇到未知代理类型会整份拒载，
+#                     iOS 5.x / Mac 6.12 以下的客户端必须继续用这一份。
+#   surge-vless.conf  完整版，含 VLESS（REALITY / Vision / WS），需 Surge iOS 6.0+ / Mac 6.12+。
+gen_surge_sub()       { _gen_surge_profile 0; }
+gen_surge_vless_sub() { _gen_surge_profile 1; }
+
+_gen_surge_profile() {  # include_vless(0|1)
+    local with_vless="${1:-0}"
     local ipv4 ipv6 addr cc proto core cfg body="" names=""
     ipv4=$(get_ipv4); ipv6=$(get_ipv6); addr="$ipv4"; [[ -z "$addr" ]] && addr="$ipv6"
     cc=$(get_ip_country "$ipv4"); [[ -z "$cc" || "$cc" == "XX" ]] && cc=$(get_ip_country "$ipv6")
     for proto in $(db_all_protocols); do
+        [[ "$with_vless" != "1" && "$proto" == vless-* ]] && continue
         core=$(proto_core "$proto")
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
@@ -10532,7 +10583,10 @@ gen_surge_sub() {
             [[ -n "$line" ]] && { body+="$line"$'\n'; names+="${names:+, }${label}"; }
         done < <(db_instances "$core" "$proto")
     done
+    local note="# 兼容版：不含 VLESS，适用于全部 Surge 版本"
+    [[ "$with_vless" == "1" ]] && note="# 含 VLESS：需要 Surge iOS 6.0+ / Mac 6.12+，旧版本请使用 /surge 订阅"
     cat <<EOF
+${note}
 [General]
 loglevel = notify
 
@@ -10557,20 +10611,48 @@ generate_sub_files() {
         _err "无法创建订阅文件暂存目录"; return 1; }
     if ! gen_v2ray_sub >"$stage/base64" ||
        ! gen_clash_sub >"$stage/clash.yaml" ||
-       ! gen_surge_sub >"$stage/surge.conf"; then
+       ! gen_surge_sub >"$stage/surge.conf" ||
+       ! gen_surge_vless_sub >"$stage/surge-vless.conf"; then
         rm -rf "$stage"
         _err "订阅内容生成失败，原文件保持不变"
         return 1
     fi
     chmod 644 "$stage"/* 2>/dev/null || {
         rm -rf "$stage"; _err "订阅文件权限设置失败"; return 1; }
-    # 三个文件均生成成功后再逐个原子替换，避免生成中途留下空文件。
-    for f in base64 clash.yaml surge.conf; do
+    # 全部文件生成成功后再逐个原子替换，避免生成中途留下空文件。
+    for f in $SUB_FILES; do
         mv -f "$stage/$f" "$dir/$f" || {
             rm -rf "$stage"; _err "订阅文件写入失败: $f"; return 1; }
     done
     rm -rf "$stage"
+    _ensure_sub_nginx_routes "$uuid" "$dir"
     _ok "订阅文件已生成"
+}
+
+# 旧版本写出的 Nginx 订阅配置没有 /surge-vless 路由：检测到即补一行并热重载。
+# nginx -t 不通过就还原原文件，绝不影响已在使用的订阅链接。
+_ensure_sub_nginx_routes() {  # uuid dir
+    local uuid="$1" dir="$2" conf bak tmp
+    conf="$(_nginx_conf_dir)/vless-sub.conf"
+    [[ -f "$conf" ]] && check_cmd nginx || return 0
+    grep -q "/sub/${uuid}/surge-vless" "$conf" && return 0
+    grep -q "location = /sub/${uuid}/surge " "$conf" || return 0
+    bak="${conf}.bak.$$"; tmp="${conf}.new.$$"
+    cp -p "$conf" "$bak" || return 0
+    awk -v u="$uuid" -v d="$dir" '
+        { print }
+        index($0, "location = /sub/" u "/surge ") {
+            print "    location = /sub/" u "/surge-vless { alias " d "/surge-vless.conf; default_type text/plain; }"
+        }' "$bak" >"$tmp" && mv -f "$tmp" "$conf" || { rm -f "$tmp" "$bak"; return 0; }
+    if nginx -t >/dev/null 2>&1; then
+        nginx -s reload >/dev/null 2>&1 || svc restart nginx >/dev/null 2>&1
+        rm -f "$bak"
+        _info "订阅服务已新增 Surge VLESS 路由: /sub/${uuid}/surge-vless"
+    else
+        mv -f "$bak" "$conf"
+        _warn "Nginx 未能加载 Surge VLESS 订阅路由，已还原原配置"
+    fi
+    return 0
 }
 
 # 本地订阅文件与 Nginx 是否公开访问完全解耦。协议/用户/证书变更后统一调用；
@@ -10670,6 +10752,7 @@ ${ssl_b}
     location = /sub/${uuid}/v2ray { alias ${dir}/base64;     default_type text/plain; }
     location = /sub/${uuid}/clash { alias ${dir}/clash.yaml; default_type text/yaml; }
     location = /sub/${uuid}/surge { alias ${dir}/surge.conf; default_type text/plain; }
+    location = /sub/${uuid}/surge-vless { alias ${dir}/surge-vless.conf; default_type text/plain; }
 
     location / { try_files \$uri \$uri/ =404; }
     server_tokens off;
@@ -10704,9 +10787,12 @@ show_sub_links() {
     echo -e "  ${W}订阅链接${NC}" >&2
     _line
     echo -e "  ${Y}Clash / Mihomo:${NC}  ${G}${base}/clash${NC}" >&2
-    echo -e "  ${Y}Surge (含 VLESS):${NC} ${G}${base}/surge${NC}" >&2
+    echo -e "  ${Y}Surge 兼容版:${NC}    ${G}${base}/surge${NC}" >&2
+    echo -e "  ${Y}Surge VLESS 版:${NC}  ${G}${base}/surge-vless${NC}" >&2
     echo -e "  ${Y}V2Ray / 通用:${NC}    ${G}${base}/v2ray${NC}" >&2
     _line
+    echo -e "  ${D}Surge VLESS 版含 VLESS 节点，需 Surge iOS 6.0+ / Mac 6.12+；${NC}" >&2
+    echo -e "  ${D}旧版 Surge 遇到 vless 行会整份拒载，请改用兼容版${NC}" >&2
     echo -e "  ${D}路径包含随机 UUID，请妥善保管${NC}" >&2
     [[ "$sub_https" == "true" && -z "$sub_domain" ]] && \
         echo -e "  ${Y}提示: 使用自签证书时部分客户端会拒绝拉取，建议绑定域名或改用 HTTP${NC}" >&2
@@ -11108,9 +11194,16 @@ update_core_menu() {
         # 先在父 shell 里抓一次发布说明，下面三个命令替换才能共用同一份缓存
         _snell_fetch_release_page
         s4r=$(_snell_version 4 quiet); s5r=$(_snell_version 5 quiet); s6r=$(_snell_version 6 quiet)
-        echo -e "  ${W}Snell v4${NC}      当前: ${G}${s4c}${NC}   最新: ${C}${s4r:-查询失败}${NC}" >&2
-        echo -e "  ${W}Snell v5${NC}      当前: ${G}${s5c}${NC}   最新: ${C}${s5r:-查询失败}${NC}" >&2
-        echo -e "  ${W}Snell v6${NC}      当前: ${G}${s6c}${NC}   最新: ${C}${s6r:-本架构无构建}${NC} ${D}(Beta)${NC}" >&2
+        local up4="" up5="" up6="" s6tag=""
+        _snell_needs_upgrade "$s4c" "$s4r" && up4=" ${Y}[可更新]${NC}"
+        _snell_needs_upgrade "$s5c" "$s5r" && up5=" ${Y}[可更新]${NC}"
+        _snell_needs_upgrade "$s6c" "$s6r" && up6=" ${Y}[可更新]${NC}"
+        _snell_is_prerelease "$s6c" && s6tag=" ${D}(已装预发布版)${NC}"
+        echo -e "  ${W}Snell v4${NC}      当前: ${G}${s4c}${NC}   最新: ${C}${s4r:-查询失败}${NC}${up4}" >&2
+        echo -e "  ${W}Snell v5${NC}      当前: ${G}${s5c}${NC}   最新: ${C}${s5r:-查询失败}${NC}${up5}" >&2
+        echo -e "  ${W}Snell v6${NC}      当前: ${G}${s6c}${NC}${s6tag}   最新: ${C}${s6r:-本架构无构建}${NC}${up6}" >&2
+        [[ -n "$up6" ]] &&
+            echo -e "  ${D}Snell v6 预发布版之间可能协议不兼容，更新服务端后请同步更新 Surge${NC}" >&2
         _line
         _item "1" "更新 Sing-box 到最新版"
         _item "2" "安装 Sing-box 指定版本"

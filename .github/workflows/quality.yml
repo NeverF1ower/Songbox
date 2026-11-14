@@ -34,6 +34,7 @@ jobs:
           bash tests/test_name_compat.sh
           bash tests/test_decoy_templates.sh
           bash tests/test_subscription_sync.sh
+          bash tests/test_surge_vless.sh
           bash tests/test_singbox_upgrade.sh
 
   singbox-config-compat:

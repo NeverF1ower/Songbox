@@ -46,7 +46,7 @@ Debian、Ubuntu、CentOS 使用 systemd 管理服务，Alpine 使用 OpenRC。�
 | QUIC/UDP | Hysteria2、TUIC v5 |
 | 其他 Sing-box 入站 | AnyTLS、Shadowsocks 2022、传统 Shadowsocks、SOCKS5、NaïveProxy |
 | ShadowTLS | Shadowsocks 2022 + ShadowTLS v3 |
-| Surge/Snell | Snell v4、v5、v6 Beta，以及 Snell v4/v5 + ShadowTLS v3 |
+| Surge/Snell | Snell v4、v5、v6（跟随官方 6.0.0，支持 default / unshaped / unsafe-raw 模式），以及 Snell v4/v5 + ShadowTLS v3 |
 
 Snell 使用独立二进制和独立服务；其余协议由 Sing-box 统一管理。传统 Shadowsocks 与 Snell 属于单用户协议，其余多数协议支持脚本内的多用户管理。
 
@@ -127,11 +127,14 @@ vless
 脚本在首次安装协议时就会生成以下本地订阅文件，并在新增、替换、删除协议，修改协议地址/SNI、用户启停或节点名称后自动刷新。这个过程不要求启用 Nginx 订阅服务：
 
 - Clash / Mihomo YAML
-- Surge 配置
+- Surge 配置（兼容版 `/surge`：不含 VLESS，适用于全部 Surge 版本）
+- Surge 配置（VLESS 版 `/surge-vless`：含 VLESS-REALITY / Vision / WS，需 Surge iOS 6.0+ / Mac 6.12+）
 - V2Ray / 通用 Base64 订阅
 - 单节点分享链接与终端二维码
 
 本地文件保存在 `/etc/vless-reality/subscription/<随机UUID>/`。启用订阅服务后，Nginx 才会通过 URL 对外提供这些文件；停用服务不会删除文件，后续配置变化仍会继续更新。订阅路径包含随机 UUID，但它本质上仍是访问凭据，请勿公开传播。
+
+旧版 Surge 遇到无法识别的 `vless` 代理行会拒绝加载整份配置，所以 VLESS 节点单独放在 `/surge-vless`。从旧版本升级后，脚本在下一次刷新订阅时会自动生成 `surge-vless.conf`，并为已启用的 Nginx 订阅服务补上对应路由。
 
 ### 分流与中转
 

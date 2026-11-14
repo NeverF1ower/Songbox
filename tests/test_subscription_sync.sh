@@ -24,6 +24,7 @@ REVISION=1
 gen_v2ray_sub() { printf 'base64-revision-%s\n' "$REVISION"; }
 gen_clash_sub() { printf 'clash-revision-%s\n' "$REVISION"; }
 gen_surge_sub() { printf 'surge-revision-%s\n' "$REVISION"; }
+gen_surge_vless_sub() { printf 'surge-vless-revision-%s\n' "$REVISION"; }
 
 generate_sub_files || fail "generation failed while subscription service was disabled"
 [[ ! -e "$SONGBOX_CFG_DIR/sub.info" ]] || fail "file generation unexpectedly enabled the public service"
@@ -32,6 +33,7 @@ dir="$SONGBOX_CFG_DIR/subscription/$uuid"
 assert_eq "$(cat "$dir/base64")" "base64-revision-1" "initial Base64 subscription"
 assert_eq "$(cat "$dir/clash.yaml")" "clash-revision-1" "initial Clash subscription"
 assert_eq "$(cat "$dir/surge.conf")" "surge-revision-1" "initial Surge subscription"
+assert_eq "$(cat "$dir/surge-vless.conf")" "surge-vless-revision-1" "initial Surge VLESS subscription"
 pass "local subscription files are generated without enabling Nginx"
 
 REVISION=2
@@ -39,6 +41,7 @@ _refresh_subscription_files
 assert_eq "$(cat "$dir/base64")" "base64-revision-2" "refreshed Base64 subscription"
 assert_eq "$(cat "$dir/clash.yaml")" "clash-revision-2" "refreshed Clash subscription"
 assert_eq "$(cat "$dir/surge.conf")" "surge-revision-2" "refreshed Surge subscription"
+assert_eq "$(cat "$dir/surge-vless.conf")" "surge-vless-revision-2" "refreshed Surge VLESS subscription"
 [[ ! -e "$SONGBOX_CFG_DIR/sub.info" ]] || fail "refresh unexpectedly enabled the public service"
 pass "configuration refresh updates all generated formats while service stays disabled"
 
@@ -50,16 +53,18 @@ fi
 assert_eq "$(cat "$dir/base64")" "base64-revision-2" "failed refresh preserves Base64 subscription"
 assert_eq "$(cat "$dir/clash.yaml")" "clash-revision-2" "failed refresh preserves Clash subscription"
 assert_eq "$(cat "$dir/surge.conf")" "surge-revision-2" "failed refresh preserves Surge subscription"
+assert_eq "$(cat "$dir/surge-vless.conf")" "surge-vless-revision-2" "failed refresh preserves Surge VLESS subscription"
 pass "failed rendering leaves the previous subscription set intact"
 
 gen_clash_sub() { printf 'clash-revision-%s\n' "$REVISION"; }
 db_all_protocols() { echo "vless-reality"; }
 REVISION=3
-rm -f "$dir/clash.yaml"
+rm -f "$dir/clash.yaml" "$dir/surge-vless.conf"
 ensure_subscription_files
 assert_eq "$(cat "$dir/base64")" "base64-revision-3" "upgrade self-heal Base64 subscription"
 assert_eq "$(cat "$dir/clash.yaml")" "clash-revision-3" "upgrade self-heal Clash subscription"
 assert_eq "$(cat "$dir/surge.conf")" "surge-revision-3" "upgrade self-heal Surge subscription"
+assert_eq "$(cat "$dir/surge-vless.conf")" "surge-vless-revision-3" "upgrade self-heal Surge VLESS subscription"
 pass "an existing installation self-heals missing subscription files"
 
 for fn in do_install uninstall_specific_protocol _add_user check_and_disable_expired \
