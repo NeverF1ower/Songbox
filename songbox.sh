@@ -42,7 +42,7 @@ fi
 readonly VERSION="0.1.5"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="songbox"
-readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14+surge-vless-sub+snell-6.0.0+alpine-cpu-quota+udp-limit"
+readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14+surge-vless-sub+snell-6.0.0+alpine-cpu-quota+realm-udp-limit"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（保留 VLESS_* 环境变量，兼容已安装的旧版本）
@@ -207,10 +207,10 @@ svc() {
         case "$action" in
             start|restart)
                 rc-service "$name" "$action" || return
-                [[ "$name" != "$SB_SVC" ]] || _sync_udp_limit reload ;;
+                _sync_udp_limit "$name" ;;
             stop)
                 rc-service "$name" stop &>/dev/null || return
-                [[ "$name" != "$SB_SVC" ]] || _sync_udp_limit clear_limit ;;
+                _sync_udp_limit "$name" ;;
             enable)  rc-update add "$name" default &>/dev/null ;;
             disable) rc-update del "$name" default &>/dev/null ;;
             status)
@@ -11041,28 +11041,37 @@ _udp_limit_saved() {
     local rates
     [[ -f "$UDP_LIMIT_UNIT" && ! -L "$UDP_LIMIT_UNIT" ]] || return 1
     rates=$(sed -n '2s/^# Songbox UDP limit: //p' "$UDP_LIMIT_UNIT")
-    [[ "$rates" =~ ^(0|[1-9][0-9]{0,3})[[:space:]](0|[1-9][0-9]{0,3})$ ]] || return 1
+    [[ "$rates" =~ ^(0|[1-9][0-9]{0,3})[[:space:]](0|[1-9][0-9]{0,3})([[:space:]]realm)?$ ]] || return 1
     printf '%s\n' "$rates"
 }
 
-# OpenRC 开机读取当前 Sing-box 配置，直接安装规则，无需再次运行管理脚本。
+# OpenRC 开机读取当前监听端口，无需再次运行管理脚本。
 _write_udp_limit_openrc() {
-    local rx="$1" tx="$2" config="${SB_CONFIG//\'/\'\\\'\'}"
-    printf '#!/sbin/openrc-run\n# Songbox UDP limit: %s %s\n' "$rx" "$tx"
+    local rx="$1" tx="$2" include_realm="$3" config="${SB_CONFIG//\'/\'\\\'\'}"
+    local pidfile="${SONGBOX_TEST_OPENRC_RUN_DIR:-/run}/$REALM_SVC.pid"
+    printf '#!/sbin/openrc-run\n# Songbox UDP limit: %s %s%s\n' "$rx" "$tx" "${include_realm:+ $include_realm}"
     printf "config='%s'\nsingbox_service='%s'\nudp_table='%s'\nrx_rate=%s\ntx_rate=%s\n" \
         "$config" "$SB_SVC" "$UDP_LIMIT_TABLE" "$((rx * 125000))" "$((tx * 125000))"
+    printf "include_realm='%s'\nrealm_service='%s'\nrealm_config='%s'\nrealm_pidfile='%s'\n" \
+        "$include_realm" "$REALM_SVC" "${REALM_CONF//\'/\'\\\'\'}" "${pidfile//\'/\'\\\'\'}"
+    if [[ "$include_realm" == realm ]]; then declare -f _realm_rules_tsv; fi
     cat <<'EOUDP'
 
-description="Songbox TUIC / Hysteria2 UDP rate limit"
+description="Songbox UDP port rate limit"
 extra_commands="reload clear_limit"
 
 depend() {
     need localmount
-    after firewall iptables ip6tables nftables vless-singbox
+    after firewall iptables ip6tables nftables vless-singbox vless-realm
 }
 
 replace_udp_limit() {
-    local ports="$1" tables listed existing=no
+    local ports="$1" realm_ports="$2" tables listed existing=no input_scope="" output_scope=""
+    if [ -n "$realm_ports" ]; then
+        # Realm 转发给同机 Sing-box 的包走 lo，只在对外端口上计速。
+        input_scope='iifname != "lo" '
+        output_scope='oifname != "lo" '
+    fi
     tables=$(nft -n list tables) || return 1
     if printf '%s\n' "$tables" | grep -Fxq "table inet $udp_table"; then
         listed=$(nft -n list table inet "$udp_table") || return 1
@@ -11079,55 +11088,95 @@ replace_udp_limit() {
             printf 'create table inet %s\n' "$udp_table"
             if [ "$rx_rate" -gt 0 ]; then
                 printf 'add chain inet %s from_client { type filter hook input priority 10; policy accept; }\n' "$udp_table"
-                printf 'add rule inet %s from_client udp dport { %s } limit rate over %s bytes/second counter drop comment "Songbox QUIC UDP limit"\n' \
-                    "$udp_table" "$ports" "$rx_rate"
+                printf 'add rule inet %s from_client %sudp dport { %s } limit rate over %s bytes/second counter drop comment "Songbox QUIC UDP limit"\n' \
+                    "$udp_table" "$input_scope" "$ports" "$rx_rate"
             fi
             if [ "$tx_rate" -gt 0 ]; then
                 printf 'add chain inet %s to_client { type filter hook output priority 10; policy accept; }\n' "$udp_table"
-                printf 'add rule inet %s to_client udp sport { %s } limit rate over %s bytes/second counter drop comment "Songbox QUIC UDP limit"\n' \
-                    "$udp_table" "$ports" "$tx_rate"
+                printf 'add rule inet %s to_client %sudp sport { %s } limit rate over %s bytes/second counter drop comment "Songbox QUIC UDP limit"\n' \
+                    "$udp_table" "$output_scope" "$ports" "$tx_rate"
             fi
         fi
     } | nft -f -
 }
 
+realm_udp_ports() {
+    local endpoints configured pid="" sockets ports="" attempt
+    endpoints=$(_realm_rules_tsv "$realm_config") || return 1
+    configured=$(printf '%s\n' "$endpoints" | awk -F '\t' '$2 ~ /:[0-9]+$/ {
+        port=$2; sub(/^.*:/, "", port); port+=0
+        if (port > 0 && port <= 65535) print port
+    }' | sort -nu)
+    [ -n "$configured" ] || return 0
+
+    # 只取配置中的监听端口，排除 TCP-only 端点、其他进程及 Realm 临时 UDP 出口。
+    for attempt in 1 2 3; do
+        pid=$(cat "$realm_pidfile" 2>/dev/null) || pid=""
+        case "$pid" in
+            ""|0|*[!0-9]*) pid="" ;;
+            *)
+                sockets=$(ss -H -l -u -n -p) || return 1
+                ports=$(printf '%s\n' "$sockets" | awk -v pid="$pid" -v configured="$configured" '
+                    BEGIN { n=split(configured, entries, "\n"); for (i=1; i<=n; i++) allow[entries[i]]=1 }
+                    index($0, "pid=" pid ",") {
+                        addr=($1 == "udp" ? $5 : $4)
+                        sub(/^.*:/, "", addr)
+                        if (addr in allow) print addr
+                    }
+                ' | sort -nu)
+                [ "$ports" = "$configured" ] && break ;;
+        esac
+        if [ "$attempt" -lt 3 ]; then sleep 1; fi
+    done
+    [ -n "$pid" ] || { eerror "Cannot read the Realm service PID"; return 1; }
+    printf '%s\n' "$ports"
+}
+
 reload() {
-    local ports=""
+    local ports="" relay_ports=""
     if rc-service "$singbox_service" status >/dev/null 2>&1 && [ -f "$config" ]; then
         ports=$(jq -er '[.inbounds[]? | select(.type == "tuic" or .type == "hysteria2") |
             .listen_port | select(type == "number" and (. % 1 == 0) and (. >= 1 and . <= 65535))] |
-            unique | join(", ")' <"$config") || return 1
+            unique | join("\n")' <"$config") || return 1
     fi
-    replace_udp_limit "$ports"
+    if [ "$include_realm" = realm ] && rc-service "$realm_service" status >/dev/null 2>&1; then
+        relay_ports=$(realm_udp_ports) || return 1
+    fi
+    ports=$(printf '%s\n%s\n' "$ports" "$relay_ports" |
+        jq -Rrs 'split("\n") | map(select(length > 0) | tonumber) | unique | join(", ")') || return 1
+    replace_udp_limit "$ports" "$relay_ports"
 }
 
-clear_limit() { replace_udp_limit ""; }
+clear_limit() { replace_udp_limit "" ""; }
 start() { reload; }
 stop() { clear_limit; }
 EOUDP
 }
 
 _sync_udp_limit() {
-    _udp_limit_saved >/dev/null || return 0
-    rc-service "$UDP_LIMIT_SVC" "$1" >/dev/null 2>&1 ||
+    local service="${1:-}" rates
+    case "$service" in ""|"$SB_SVC"|"$REALM_SVC") ;; *) return 0 ;; esac
+    rates=$(_udp_limit_saved) || return 0
+    [[ "$service" != "$REALM_SVC" || "$rates" == *" realm" ]] || return 0
+    rc-service "$UDP_LIMIT_SVC" reload >/dev/null 2>&1 ||
         _warn "UDP 限速规则同步失败，可用 --udp-limit 检查当前规则"
     return 0
 }
 
 show_udp_limit() {
     [[ "$DISTRO" == alpine ]] || { _err "UDP 端口限速适用于 Alpine / OpenRC"; return 1; }
-    local rates rx tx rules
+    local rates rx tx include_realm rules
     if ! rates=$(_udp_limit_saved); then
         _info "Songbox UDP 端口限速未启用"
         return 0
     fi
-    read -r rx tx <<<"$rates"
-    _info "TUIC / Hysteria2 合计限速（IPv4 和 IPv6 共享，0 表示不限）"
+    read -r rx tx include_realm <<<"$rates"
+    _info "TUIC / Hysteria2${include_realm:+ / Realm} 合计限速（IPv4 和 IPv6 共享，0 表示不限）"
     _info "VPS 接收 ${rx} Mbps，发送 ${tx} Mbps"
     if rules=$(nft -n list table inet "$UDP_LIMIT_TABLE" 2>/dev/null); then
         printf '%s\n' "$rules" >&2
     else
-        _warn "当前未读到限速规则，请检查 Sing-box 是否在运行、是否有 QUIC 入站及 nftables 权限"
+        _warn "当前未读到限速规则，请检查目标 UDP 服务和 nftables 权限"
     fi
     if _openrc_cpu_quota_saved >/dev/null; then
         _info "Sing-box 进程 CPU 限额也已配置。如只需要 UDP 限速，可在核对规则后关闭进程限额。"
@@ -11137,7 +11186,7 @@ show_udp_limit() {
 
 set_udp_limit() (
     [[ "$DISTRO" == alpine ]] || { _err "UDP 端口限速适用于 Alpine / OpenRC"; return 1; }
-    local rx="$1" tx="$2" previous boot_services enabled=false txn="" action
+    local rx="$1" tx="$2" scope="${3:-keep}" include_realm="" previous boot_services enabled=false txn="" action
     if [[ ! "$rx" =~ ^(0|[1-9][0-9]{0,3})$ || ! "$tx" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
         _err "请输入 0–9999 的整数 Mbps，0 表示该方向不限"
         return 1
@@ -11145,6 +11194,12 @@ set_udp_limit() (
     _db_lock_acquire || return 1
     trap '[[ -z "$txn" ]] || { rm -f "$txn/old" "$txn/new"; rmdir "$txn"; }; _db_lock_release' EXIT
     previous=$(_udp_limit_saved) || previous=""
+    case "$scope" in
+        keep) if [[ "$previous" == *" realm" ]]; then include_realm=realm; fi ;;
+        --realm) include_realm=realm ;;
+        --no-realm) ;;
+        *) _err "Realm 选项仅支持 --realm 或 --no-realm"; return 1 ;;
+    esac
     if [[ -z "$previous" && ( -e "$UDP_LIMIT_UNIT" || -L "$UDP_LIMIT_UNIT" ) ]]; then
         _err "同名 OpenRC 服务由管理员维护，无法使用 $UDP_LIMIT_UNIT"
         return 1
@@ -11162,10 +11217,10 @@ set_udp_limit() (
         if rc-service "$UDP_LIMIT_SVC" status >/dev/null 2>&1; then action=stop; fi
         if rc-service "$UDP_LIMIT_SVC" "$action"; then
             if rm -f "$UDP_LIMIT_UNIT"; then
-                _ok "已关闭 TUIC / Hysteria2 UDP 端口限速"
+                _ok "已关闭 UDP 端口限速"
                 return 0
             fi
-            _sync_udp_limit reload
+            _sync_udp_limit
         fi
         if [[ "$enabled" == true ]]; then
             rc-update add "$UDP_LIMIT_SVC" default || _warn "恢复 UDP 限速开机启动失败"
@@ -11177,9 +11232,12 @@ set_udp_limit() (
     check_cmd nft || apk add --no-cache nftables || { _err "安装 nftables 失败"; return 1; }
     nft -n list tables >/dev/null || { _err "容器无法访问 nftables，请检查商家是否开放 NET_ADMIN 和 nftables"; return 1; }
     check_cmd jq || { _err "需要 jq 来读取 Sing-box 入站配置"; return 1; }
+    if [[ "$include_realm" == realm ]] && ! check_cmd ss; then
+        apk add --no-cache iproute2-ss && check_cmd ss || { _err "需要 iproute2-ss 来读取 Realm UDP 监听端口"; return 1; }
+    fi
     txn=$(mktemp -d) || return 1
     if [[ -n "$previous" ]]; then cp -p "$UDP_LIMIT_UNIT" "$txn/old" || return 1; fi
-    _write_udp_limit_openrc "$rx" "$tx" >"$txn/new" &&
+    _write_udp_limit_openrc "$rx" "$tx" "$include_realm" >"$txn/new" &&
         _atomic_install_file "$txn/new" "$UDP_LIMIT_UNIT" 755 || return 1
     action=start
     if rc-service "$UDP_LIMIT_SVC" status >/dev/null 2>&1; then action=reload; fi
@@ -11202,12 +11260,21 @@ set_udp_limit() (
 manage_udp_limit() {
     _header
     show_udp_limit || return
-    echo "  速率按方向共享。超出的 UDP 包会被丢弃，修改时无需重启 Sing-box。" >&2
+    echo "  速率按方向共享。超出的 UDP 包会被丢弃，设置即时生效。" >&2
     echo "  两项都填 0 可关闭此功能。" >&2
-    local rx tx
+    local rx tx scope=--no-realm default_realm=n reply
     read -rp "  VPS 接收（客户端上传）Mbps［0 不限，回车返回］ " rx && [[ -n "$rx" ]] || return
     read -rp "  VPS 发送（客户端下载）Mbps［0 不限，回车返回］ " tx && [[ -n "$tx" ]] || return
-    set_udp_limit "$rx" "$tx"
+    if [[ "$rx $tx" != "0 0" ]]; then
+        if [[ "${1:-}" == --realm || "$(_udp_limit_saved)" == *" realm" ]]; then default_realm=y; fi
+        read -rp "  同时限速 Realm 的 UDP 转发 [${default_realm}] " reply || return
+        case "${reply:-$default_realm}" in
+            y|Y) scope=--realm ;;
+            n|N) ;;
+            *) _err "请输入 y 或 n"; return 1 ;;
+        esac
+    fi
+    set_udp_limit "$rx" "$tx" "$scope"
 }
 
 manage_protocol_services() {
@@ -11227,7 +11294,7 @@ manage_protocol_services() {
         _item "9" "TCP Fast Open 开关 ${D}(默认关闭，可选)${NC}"
         if [[ "$DISTRO" == alpine ]]; then
             _item "c" "Sing-box CPU 限额 ${D}(所有 Sing-box 入站)${NC}"
-            _item "u" "TUIC / Hysteria2 UDP 端口限速"
+            _item "u" "UDP 端口限速 ${D}(TUIC / Hysteria2 / 可选 Realm)${NC}"
         fi
         _item "f" "防火墙足迹 / 托管开关 ${D}(查看脚本写了什么)${NC}"
         _item "0" "返回"
@@ -11888,13 +11955,15 @@ _realm_rule_count() {
 }
 
 _realm_rules_tsv() {
-    [[ -f "$REALM_CONF" ]] || return 0
+    local config="${1:-$REALM_CONF}"
+    [ -f "$config" ] || return 0
     awk '
-        function value(line, x) {
-            x=line
-            sub(/^[^"]*"/, "", x)
-            sub(/".*$/, "", x)
-            return x
+        function value(line, quote) {
+            sub(/^[^=]*=[[:space:]]*/, "", line)
+            quote=substr(line, 1, 1)
+            if (quote != "\"" && quote != sprintf("%c", 39)) return ""
+            line=substr(line, 2)
+            return substr(line, 1, index(line, quote) - 1)
         }
         function flush() {
             if (!inside) return
@@ -11919,7 +11988,7 @@ _realm_rules_tsv() {
         inside && /^[[:space:]]*listen[[:space:]]*=/ { listen=value($0); next }
         inside && /^[[:space:]]*remote[[:space:]]*=/ { remote=value($0); next }
         END { flush() }
-    ' "$REALM_CONF"
+    ' "$config"
 }
 
 _realm_listen_port() {
@@ -12412,6 +12481,7 @@ realm_uninstall() {
     svc disable "$REALM_SVC" >/dev/null 2>&1 || true
     if [[ "$DISTRO" == "alpine" ]]; then
         rm -f "/etc/init.d/$REALM_SVC"
+        _sync_udp_limit "$REALM_SVC"
     else
         rm -f "/etc/systemd/system/$REALM_SVC.service"
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -12460,6 +12530,7 @@ realm_menu() {
         _item "12" "查看状态 / 日志"
         _item "13" "定时重启"
         _item "14" "卸载 Realm"
+        [[ "$DISTRO" == alpine ]] && _item "u" "UDP 转发限速"
         _item "0" "返回"
         _line
         local ch; read -rp "  请选择: " ch
@@ -12478,6 +12549,7 @@ realm_menu() {
             12) realm_show_logs ;;
             13) realm_schedule_menu ;;
             14) realm_uninstall ;;
+            u|U) manage_udp_limit --realm ;;
             0) return ;;
             *) _err "无效选择"; sleep 1; continue ;;
         esac
@@ -13302,7 +13374,8 @@ case "${1:-}" in
             1:*) show_udp_limit ;;
             2:0) set_udp_limit 0 0 ;;
             3:*) set_udp_limit "$2" "$3" ;;
-            *) _err "用法: $0 --udp-limit [接收Mbps 发送Mbps|0]"; exit 1 ;;
+            4:*) set_udp_limit "$2" "$3" "$4" ;;
+            *) _err "用法: $0 --udp-limit [接收Mbps 发送Mbps [--realm|--no-realm] | 0]"; exit 1 ;;
         esac
         exit $? ;;
     --cert-check)
@@ -13340,8 +13413,8 @@ case "${1:-}" in
   --show-traffic    显示端口级流量统计
   --cpu-quota [百分比|0]
                     查看、设置或关闭 Alpine 上的 Sing-box CPU 限额（修改会重启 Sing-box）
-  --udp-limit [接收Mbps 发送Mbps|0]
-                    查看、设置或关闭 Alpine 上的 TUIC / Hysteria2 UDP 端口限速
+  --udp-limit [接收Mbps 发送Mbps [--realm|--no-realm] | 0]
+                    查看、设置或关闭 Alpine 上的 UDP 端口限速，可纳入 Realm 转发
   --cert-check      检查证书剩余天数，不足 20 天时自动续期（用于定时任务）
   --cert-status     显示证书状态与各协议 SNI
   --firewall-status 审计脚本写入了哪些防火墙规则
