@@ -42,7 +42,7 @@ fi
 readonly VERSION="0.1.5"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="songbox"
-readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14+surge-vless-sub+snell-6.0.0"
+readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14+surge-vless-sub+snell-6.0.0+alpine-cpu-quota+udp-limit"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（保留 VLESS_* 环境变量，兼容已安装的旧版本）
@@ -60,6 +60,10 @@ readonly DB_LOCK_FILE="$CFG/.db.lock"
 readonly SB_CONFIG="$CFG/singbox.json"
 readonly SB_BIN="${SONGBOX_SB_BIN:-/usr/local/bin/sing-box}"
 readonly SB_SVC="vless-singbox"
+readonly SB_CPU_CONF="${SONGBOX_TEST_OPENRC_CONF_DIR:-/etc/conf.d}/$SB_SVC"
+readonly UDP_LIMIT_SVC="songbox-udp-limit"
+readonly UDP_LIMIT_UNIT="${SONGBOX_TEST_UDP_LIMIT_UNIT:-/etc/init.d/$UDP_LIMIT_SVC}"
+readonly UDP_LIMIT_TABLE="songbox_quic_limit"
 readonly REALM_DIR="$CFG/realm"
 readonly REALM_BIN="$REALM_DIR/realm"
 readonly REALM_CONF="$REALM_DIR/config.toml"
@@ -201,8 +205,12 @@ svc() {
     local action="$1" name="$2"
     if [[ "$DISTRO" == "alpine" ]]; then
         case "$action" in
-            start|restart) rc-service "$name" "$action" ;;
-            stop)    rc-service "$name" stop &>/dev/null ;;
+            start|restart)
+                rc-service "$name" "$action" || return
+                [[ "$name" != "$SB_SVC" ]] || _sync_udp_limit reload ;;
+            stop)
+                rc-service "$name" stop &>/dev/null || return
+                [[ "$name" != "$SB_SVC" ]] || _sync_udp_limit clear_limit ;;
             enable)  rc-update add "$name" default &>/dev/null ;;
             disable) rc-update del "$name" default &>/dev/null ;;
             status)
@@ -1795,7 +1803,7 @@ show_firewall_footprint() {
         echo -e "  firewalld: ${D}${fw_state}${NC}" >&2
     fi
     if iptables -V 2>/dev/null | grep -qi nf_tables; then
-        echo -e "  后端    : ${D}iptables-nft（规则最终落在 nftables 表里，脚本不直接调 nft）${NC}" >&2
+        echo -e "  后端    : ${D}iptables-nft（iptables 规则通过 nf_tables 生效）${NC}" >&2
     fi
     _line
 
@@ -10889,6 +10897,319 @@ set_node_name() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 服务管理 / BBR / 日志
 #═══════════════════════════════════════════════════════════════════════════════
+# 只使用 OpenRC 已分配给 Sing-box 的 cgroup，避免读到整个 VPS 的父级配额。
+_openrc_singbox_cpu_max_file() {
+    local cgroup_root="${SONGBOX_TEST_OPENRC_CGROUP_DIR:-/sys/fs/cgroup}"
+    local pidfile="${SONGBOX_TEST_OPENRC_RUN_DIR:-/run}/$SB_SVC.pid" pid dir
+    [[ -r "$pidfile" ]] && read -r pid <"$pidfile" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+    for dir in "$cgroup_root/openrc.$SB_SVC" "$cgroup_root/unified/openrc.$SB_SVC"; do
+        [[ -r "$dir/cpu.max" && -r "$dir/cgroup.procs" ]] || continue
+        grep -Fxq "$pid" "$dir/cgroup.procs" || continue
+        printf '%s\n' "$dir/cpu.max"
+        return 0
+    done
+    return 1
+}
+
+_write_openrc_cpu_quota() {  # 标准 OpenRC conf.d 格式，保留来自 rc.conf 的其他 cgroup 选项。
+    local percent="$1"
+    printf '# Songbox CPU quota: %s\n' "$percent"
+    printf 'rc_cgroup_settings="${rc_cgroup_settings:-}\ncpu.max %s 100000"\n' "$(( percent * 1000 ))"
+}
+
+_openrc_cpu_quota_saved() {
+    local percent
+    [[ -f "$SB_CPU_CONF" && ! -L "$SB_CPU_CONF" ]] || return 1
+    percent=$(sed -n '1s/^# Songbox CPU quota: //p' "$SB_CPU_CONF")
+    [[ "$percent" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+    # 只有文件仍完整匹配生成模板，才由脚本覆盖或删除。
+    cmp -s "$SB_CPU_CONF" <(_write_openrc_cpu_quota "$percent") || return 1
+    printf '%s\n' "$percent"
+}
+
+show_openrc_cpu_quota() {
+    [[ "$DISTRO" == alpine ]] || { _err "Sing-box CPU 限额适用于 Alpine / OpenRC"; return 1; }
+    local saved file quota period
+    if saved=$(_openrc_cpu_quota_saved); then
+        _info "已保存的 Sing-box CPU 限额 ${saved}%（100% = 一个 vCPU）"
+    elif [[ -e "$SB_CPU_CONF" || -L "$SB_CPU_CONF" ]]; then
+        _info "检测到自定义的 OpenRC 服务配置 $SB_CPU_CONF"
+    else
+        _info "Songbox CPU 限额未启用"
+    fi
+    if file=$(_openrc_singbox_cpu_max_file) && read -r quota period <"$file"; then
+        _info "运行中的 Sing-box 内核配额 cpu.max = $quota $period（微秒；max 表示本服务 cgroup 无上限）"
+    else
+        _warn "无法读取 Sing-box 的 cpu.max。请确认服务已运行，且 VPS 提供 cgroup v2 CPU 控制器。"
+    fi
+    return 0
+}
+
+set_openrc_cpu_quota() (
+    [[ "$DISTRO" == alpine ]] || { _err "Sing-box CPU 限额适用于 Alpine / OpenRC"; return 1; }
+    local percent="$1" previous file current target="" txn="" attempt running=false
+    [[ "$percent" =~ ^(0|[1-9][0-9]{0,2})$ ]] || { _err "请输入 1–999 的整数百分比，输入 0 关闭"; return 1; }
+    _db_lock_acquire || return 1
+    trap '[[ -z "$txn" ]] || { rm -f "$txn/old" "$txn/new"; rmdir "$txn"; }; _db_lock_release' EXIT
+    previous=$(_openrc_cpu_quota_saved) || previous=""
+    if [[ -z "$previous" && ( -e "$SB_CPU_CONF" || -L "$SB_CPU_CONF" ) ]]; then
+        _err "OpenRC 服务配置由管理员维护，请在 $SB_CPU_CONF 中调整 cpu.max"
+        return 1
+    fi
+    if [[ "$percent" == 0 && -z "$previous" ]]; then
+        _info "Songbox CPU 限额未启用"
+        return 0
+    fi
+    rc-service "$SB_SVC" status >/dev/null 2>&1 && running=true
+    if [[ "$percent" != 0 ]]; then
+        if [[ "$running" != true ]]; then
+            _err "请先启动 $SB_SVC，以便确认内核配额实际生效"
+            return 1
+        fi
+        if ! file=$(_openrc_singbox_cpu_max_file) || [[ ! -w "$file" ]]; then
+            _err "当前 VPS 未向 Sing-box 提供可写的 cgroup v2 CPU 控制器"
+            return 1
+        fi
+        if ! read -r current <"$file"; then return 1; fi
+        if [[ -z "$previous" && "$current" != 'max '* ]]; then
+            _err "Sing-box 已有外部 CPU 限额（cpu.max = $current），请在原配置处调整"
+            return 1
+        fi
+        target="$(( percent * 1000 )) 100000"
+        if [[ "$previous" == "$percent" && "$current" == "$target" ]]; then
+            _ok "Sing-box CPU 限额已生效（${percent}%）"
+            return 0
+        fi
+    fi
+
+    txn=$(mktemp -d) || return 1
+    if [[ -n "$previous" ]]; then cp -p "$SB_CPU_CONF" "$txn/old" || return 1; fi
+    if [[ "$percent" == 0 ]]; then
+        rm -f "$SB_CPU_CONF" || return 1
+        if [[ "$running" == false ]]; then
+            _ok "已移除 Sing-box 的 Songbox CPU 限额"
+            return 0
+        fi
+    else
+        _write_openrc_cpu_quota "$percent" >"$txn/new" &&
+            _atomic_install_file "$txn/new" "$SB_CPU_CONF" 600 || return 1
+    fi
+    if svc restart "$SB_SVC" && _singbox_runtime_healthy; then
+        for attempt in 1 2 3 4 5; do
+            if file=$(_openrc_singbox_cpu_max_file) && read -r current <"$file"; then
+                if [[ "$current" == "$target" || ( "$percent" == 0 && "$current" == 'max '* ) ]]; then
+                    _ok "已更新 Sing-box 的 CPU 限额"
+                    show_openrc_cpu_quota
+                    return 0
+                fi
+            elif [[ "$percent" == 0 ]]; then
+                _ok "已移除 Sing-box 的 Songbox CPU 限额配置，当前内核配额无法读取"
+                return 0
+            fi
+            sleep 1
+        done
+    fi
+    _err "无法确认修改结果，正在恢复原设置"
+    if [[ -n "$previous" ]]; then
+        _atomic_install_file "$txn/old" "$SB_CPU_CONF" 600 || { _err "恢复 $SB_CPU_CONF 失败"; return 1; }
+    else
+        rm -f "$SB_CPU_CONF" || return 1
+    fi
+    if ! svc restart "$SB_SVC" || ! _singbox_runtime_healthy; then
+        _err "恢复原设置后 Sing-box 启动失败，请检查服务日志"
+    elif [[ -n "$previous" ]]; then
+        if ! file=$(_openrc_singbox_cpu_max_file) || ! read -r current <"$file" ||
+           [[ "$current" != "$(( previous * 1000 )) 100000" ]]; then
+            _warn "已恢复限额配置文件，原内核配额仍未确认"
+        fi
+    fi
+    return 1
+)
+
+manage_openrc_cpu_quota() {
+    _header
+    show_openrc_cpu_quota || return 1
+    echo "  此限制由 Sing-box 的全部入站共享，修改时会短暂重启 Sing-box。" >&2
+    echo "  若 VPS 提供 1 vCPU，可先从 50% 试起，并根据商家的 CPU 规则调整。" >&2
+    local percent
+    read -rp "  CPU 限额百分比（0 关闭，回车返回）: " percent && [[ -n "$percent" ]] || return 0
+    set_openrc_cpu_quota "$percent"
+}
+
+_udp_limit_saved() {
+    local rates
+    [[ -f "$UDP_LIMIT_UNIT" && ! -L "$UDP_LIMIT_UNIT" ]] || return 1
+    rates=$(sed -n '2s/^# Songbox UDP limit: //p' "$UDP_LIMIT_UNIT")
+    [[ "$rates" =~ ^(0|[1-9][0-9]{0,3})[[:space:]](0|[1-9][0-9]{0,3})$ ]] || return 1
+    printf '%s\n' "$rates"
+}
+
+# OpenRC 开机读取当前 Sing-box 配置，直接安装规则，无需再次运行管理脚本。
+_write_udp_limit_openrc() {
+    local rx="$1" tx="$2" config="${SB_CONFIG//\'/\'\\\'\'}"
+    printf '#!/sbin/openrc-run\n# Songbox UDP limit: %s %s\n' "$rx" "$tx"
+    printf "config='%s'\nsingbox_service='%s'\nudp_table='%s'\nrx_rate=%s\ntx_rate=%s\n" \
+        "$config" "$SB_SVC" "$UDP_LIMIT_TABLE" "$((rx * 125000))" "$((tx * 125000))"
+    cat <<'EOUDP'
+
+description="Songbox TUIC / Hysteria2 UDP rate limit"
+extra_commands="reload clear_limit"
+
+depend() {
+    need localmount
+    after firewall iptables ip6tables nftables vless-singbox
+}
+
+replace_udp_limit() {
+    local ports="$1" tables listed existing=no
+    tables=$(nft -n list tables) || return 1
+    if printf '%s\n' "$tables" | grep -Fxq "table inet $udp_table"; then
+        listed=$(nft -n list table inet "$udp_table") || return 1
+        if ! printf '%s\n' "$listed" | grep -Fq 'comment "Songbox QUIC UDP limit"'; then
+            eerror "Table inet $udp_table is not managed by Songbox"
+            return 1
+        fi
+        existing=yes
+    fi
+    [ "$existing" = yes ] || [ -n "$ports" ] || return 0
+    {
+        if [ "$existing" = yes ]; then printf 'delete table inet %s\n' "$udp_table"; fi
+        if [ -n "$ports" ]; then
+            printf 'create table inet %s\n' "$udp_table"
+            if [ "$rx_rate" -gt 0 ]; then
+                printf 'add chain inet %s from_client { type filter hook input priority 10; policy accept; }\n' "$udp_table"
+                printf 'add rule inet %s from_client udp dport { %s } limit rate over %s bytes/second counter drop comment "Songbox QUIC UDP limit"\n' \
+                    "$udp_table" "$ports" "$rx_rate"
+            fi
+            if [ "$tx_rate" -gt 0 ]; then
+                printf 'add chain inet %s to_client { type filter hook output priority 10; policy accept; }\n' "$udp_table"
+                printf 'add rule inet %s to_client udp sport { %s } limit rate over %s bytes/second counter drop comment "Songbox QUIC UDP limit"\n' \
+                    "$udp_table" "$ports" "$tx_rate"
+            fi
+        fi
+    } | nft -f -
+}
+
+reload() {
+    local ports=""
+    if rc-service "$singbox_service" status >/dev/null 2>&1 && [ -f "$config" ]; then
+        ports=$(jq -er '[.inbounds[]? | select(.type == "tuic" or .type == "hysteria2") |
+            .listen_port | select(type == "number" and (. % 1 == 0) and (. >= 1 and . <= 65535))] |
+            unique | join(", ")' <"$config") || return 1
+    fi
+    replace_udp_limit "$ports"
+}
+
+clear_limit() { replace_udp_limit ""; }
+start() { reload; }
+stop() { clear_limit; }
+EOUDP
+}
+
+_sync_udp_limit() {
+    _udp_limit_saved >/dev/null || return 0
+    rc-service "$UDP_LIMIT_SVC" "$1" >/dev/null 2>&1 ||
+        _warn "UDP 限速规则同步失败，可用 --udp-limit 检查当前规则"
+    return 0
+}
+
+show_udp_limit() {
+    [[ "$DISTRO" == alpine ]] || { _err "UDP 端口限速适用于 Alpine / OpenRC"; return 1; }
+    local rates rx tx rules
+    if ! rates=$(_udp_limit_saved); then
+        _info "Songbox UDP 端口限速未启用"
+        return 0
+    fi
+    read -r rx tx <<<"$rates"
+    _info "TUIC / Hysteria2 合计限速（IPv4 和 IPv6 共享，0 表示不限）"
+    _info "VPS 接收 ${rx} Mbps，发送 ${tx} Mbps"
+    if rules=$(nft -n list table inet "$UDP_LIMIT_TABLE" 2>/dev/null); then
+        printf '%s\n' "$rules" >&2
+    else
+        _warn "当前未读到限速规则，请检查 Sing-box 是否在运行、是否有 QUIC 入站及 nftables 权限"
+    fi
+    if _openrc_cpu_quota_saved >/dev/null; then
+        _info "Sing-box 进程 CPU 限额也已配置。如只需要 UDP 限速，可在核对规则后关闭进程限额。"
+    fi
+    return 0
+}
+
+set_udp_limit() (
+    [[ "$DISTRO" == alpine ]] || { _err "UDP 端口限速适用于 Alpine / OpenRC"; return 1; }
+    local rx="$1" tx="$2" previous boot_services enabled=false txn="" action
+    if [[ ! "$rx" =~ ^(0|[1-9][0-9]{0,3})$ || ! "$tx" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
+        _err "请输入 0–9999 的整数 Mbps，0 表示该方向不限"
+        return 1
+    fi
+    _db_lock_acquire || return 1
+    trap '[[ -z "$txn" ]] || { rm -f "$txn/old" "$txn/new"; rmdir "$txn"; }; _db_lock_release' EXIT
+    previous=$(_udp_limit_saved) || previous=""
+    if [[ -z "$previous" && ( -e "$UDP_LIMIT_UNIT" || -L "$UDP_LIMIT_UNIT" ) ]]; then
+        _err "同名 OpenRC 服务由管理员维护，无法使用 $UDP_LIMIT_UNIT"
+        return 1
+    fi
+    if [[ "$rx $tx" == "0 0" && -z "$previous" ]]; then
+        _info "Songbox UDP 端口限速未启用"
+        return 0
+    fi
+    boot_services=$(rc-update show default) || { _err "无法读取 OpenRC 启动服务"; return 1; }
+    if grep -qw "$UDP_LIMIT_SVC" <<<"$boot_services"; then enabled=true; fi
+
+    if [[ "$rx $tx" == "0 0" ]]; then
+        if [[ "$enabled" == true ]]; then rc-update del "$UDP_LIMIT_SVC" default || return 1; fi
+        action=clear_limit
+        if rc-service "$UDP_LIMIT_SVC" status >/dev/null 2>&1; then action=stop; fi
+        if rc-service "$UDP_LIMIT_SVC" "$action"; then
+            if rm -f "$UDP_LIMIT_UNIT"; then
+                _ok "已关闭 TUIC / Hysteria2 UDP 端口限速"
+                return 0
+            fi
+            _sync_udp_limit reload
+        fi
+        if [[ "$enabled" == true ]]; then
+            rc-update add "$UDP_LIMIT_SVC" default || _warn "恢复 UDP 限速开机启动失败"
+        fi
+        _err "UDP 端口限速移除失败，请检查 nftables 和 OpenRC"
+        return 1
+    fi
+
+    check_cmd nft || apk add --no-cache nftables || { _err "安装 nftables 失败"; return 1; }
+    nft -n list tables >/dev/null || { _err "容器无法访问 nftables，请检查商家是否开放 NET_ADMIN 和 nftables"; return 1; }
+    check_cmd jq || { _err "需要 jq 来读取 Sing-box 入站配置"; return 1; }
+    txn=$(mktemp -d) || return 1
+    if [[ -n "$previous" ]]; then cp -p "$UDP_LIMIT_UNIT" "$txn/old" || return 1; fi
+    _write_udp_limit_openrc "$rx" "$tx" >"$txn/new" &&
+        _atomic_install_file "$txn/new" "$UDP_LIMIT_UNIT" 755 || return 1
+    action=start
+    if rc-service "$UDP_LIMIT_SVC" status >/dev/null 2>&1; then action=reload; fi
+    if rc-update add "$UDP_LIMIT_SVC" default >/dev/null && rc-service "$UDP_LIMIT_SVC" "$action"; then
+        show_udp_limit
+        return 0
+    fi
+    if [[ "$enabled" == false ]] && rc-update show default | grep -qw "$UDP_LIMIT_SVC"; then
+        rc-update del "$UDP_LIMIT_SVC" default || _warn "无法取消 UDP 限速开机启动"
+    fi
+    if [[ -n "$previous" ]]; then
+        _atomic_install_file "$txn/old" "$UDP_LIMIT_UNIT" 755 || _warn "恢复原限速服务文件失败"
+    else
+        rm -f "$UDP_LIMIT_UNIT" || _warn "删除未启用的限速服务文件失败"
+    fi
+    _err "UDP 端口限速应用失败，请检查 nftables byte limit 支持及上方错误"
+    return 1
+)
+
+manage_udp_limit() {
+    _header
+    show_udp_limit || return
+    echo "  速率按方向共享。超出的 UDP 包会被丢弃，修改时无需重启 Sing-box。" >&2
+    echo "  两项都填 0 可关闭此功能。" >&2
+    local rx tx
+    read -rp "  VPS 接收（客户端上传）Mbps［0 不限，回车返回］ " rx && [[ -n "$rx" ]] || return
+    read -rp "  VPS 发送（客户端下载）Mbps［0 不限，回车返回］ " tx && [[ -n "$tx" ]] || return
+    set_udp_limit "$rx" "$tx"
+}
+
 manage_protocol_services() {
     while true; do
         _header
@@ -10904,6 +11225,10 @@ manage_protocol_services() {
         _item "7" "从备份恢复 ${D}(重装系统后导入)${NC}"
         _item "8" "修改 REALITY / ShadowTLS 伪装域名 ${D}(保留密钥不变)${NC}"
         _item "9" "TCP Fast Open 开关 ${D}(默认关闭，可选)${NC}"
+        if [[ "$DISTRO" == alpine ]]; then
+            _item "c" "Sing-box CPU 限额 ${D}(所有 Sing-box 入站)${NC}"
+            _item "u" "TUIC / Hysteria2 UDP 端口限速"
+        fi
         _item "f" "防火墙足迹 / 托管开关 ${D}(查看脚本写了什么)${NC}"
         _item "0" "返回"
         _line
@@ -10926,6 +11251,8 @@ manage_protocol_services() {
             7) do_restore ""; _pause ;;
             8) manage_handshake_sni; _pause ;;
             9) manage_tfo ;;
+            c|C) manage_openrc_cpu_quota; _pause ;;
+            u|U) manage_udp_limit; _pause ;;
             f|F) toggle_firewall_management; _pause ;;
             0) return ;;
             *) _err "无效选择"; sleep 1 ;;
@@ -12165,6 +12492,9 @@ do_uninstall() {
     _line
     _ask_yes "确认卸载所有协议与配置?" || return
 
+    if [[ "$DISTRO" == alpine ]] && _udp_limit_saved >/dev/null; then
+        set_udp_limit 0 0 || return 1
+    fi
     _info "停止所有服务..."
     stop_services
     [[ -x "$REALM_BIN" || -f "$REALM_CONF" ]] && realm_uninstall true
@@ -12177,6 +12507,7 @@ do_uninstall() {
     _info "删除服务单元..."
     local s
     if [[ "$DISTRO" == "alpine" ]]; then
+        if _openrc_cpu_quota_saved >/dev/null; then rm -f "$SB_CPU_CONF"; fi
         for s in /etc/init.d/vless-*; do
             [[ -f "$s" ]] && { rc-update del "$(basename "$s")" default 2>/dev/null; rm -f "$s"; }
         done
@@ -12960,6 +13291,20 @@ case "${1:-}" in
         exit 0 ;;
     --show-traffic)
         check_root; init_db; sync_traffic_counters; show_port_traffic; exit 0 ;;
+    --cpu-quota)
+        check_root
+        if [[ $# -eq 1 ]]; then show_openrc_cpu_quota; exit $?; fi
+        if [[ $# -ne 2 ]]; then _err "用法: $0 --cpu-quota [百分比|0]"; exit 1; fi
+        set_openrc_cpu_quota "$2"; exit $? ;;
+    --udp-limit)
+        check_root
+        case "$#:${2:-}" in
+            1:*) show_udp_limit ;;
+            2:0) set_udp_limit 0 0 ;;
+            3:*) set_udp_limit "$2" "$3" ;;
+            *) _err "用法: $0 --udp-limit [接收Mbps 发送Mbps|0]"; exit 1 ;;
+        esac
+        exit $? ;;
     --cert-check)
         check_root; init_db; cert_check_and_renew; exit 0 ;;
     --firewall-status)
@@ -12993,6 +13338,10 @@ case "${1:-}" in
   --sync-ruleset    重新下载 geosite / geoip 规则集并重载配置
   --regen-config    重新生成 Sing-box 配置并重启服务
   --show-traffic    显示端口级流量统计
+  --cpu-quota [百分比|0]
+                    查看、设置或关闭 Alpine 上的 Sing-box CPU 限额（修改会重启 Sing-box）
+  --udp-limit [接收Mbps 发送Mbps|0]
+                    查看、设置或关闭 Alpine 上的 TUIC / Hysteria2 UDP 端口限速
   --cert-check      检查证书剩余天数，不足 20 天时自动续期（用于定时任务）
   --cert-status     显示证书状态与各协议 SNI
   --firewall-status 审计脚本写入了哪些防火墙规则
